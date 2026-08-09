@@ -1,0 +1,60 @@
+{
+  "name": "AntiDebug Breaker",
+  "version": "3.5.3",
+  "description": "基于 AntiDebug Breaker 进行二次开发",
+  "manifest_version": 3,
+  "permissions": [
+    "storage",
+    "scripting",
+    "activeTab",
+    "tabs",
+    "cookies",
+    "webRequest",
+    "declarativeNetRequest",
+    "declarativeNetRequestWithHostAccess",
+    "declarativeNetRequestFeedback"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "devtools_page": "devtools/devtools.html",
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["scripts/auto_api_monitor.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["scripts/*.js"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

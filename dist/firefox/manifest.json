@@ -1,0 +1,89 @@
+{
+  "name": "AntiDebug Breaker",
+  "version": "3.5.3",
+  "description": "基于 AntiDebug Breaker 进行二次开发 - Firefox 版",
+  "manifest_version": 3,
+  "permissions": [
+    "storage",
+    "scripting",
+    "activeTab",
+    "tabs",
+    "cookies",
+    "webRequest",
+    "declarativeNetRequest",
+    "declarativeNetRequestWithHostAccess",
+    "declarativeNetRequestFeedback"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "scripts": [
+      "firefox-compat.js",
+      "api-analyzer.js",
+      "mcp-client.js",
+      "background.js"
+    ],
+    "persistent": false
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "antidebug-breaker@0xsdeo.local",
+      "strict_min_version": "142.0",
+      "data_collection_permissions": {
+        "required": [
+          "authenticationInfo",
+          "browsingActivity",
+          "websiteActivity",
+          "websiteContent"
+        ]
+      }
+    }
+  },
+  "devtools_page": "devtools/devtools.html",
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "32": "icons/icon32.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "32": "icons/icon32.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "firefox-compat.js",
+        "content.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "scripts/auto_api_monitor.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "scripts/*.js"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ]
+}
