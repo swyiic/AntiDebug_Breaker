@@ -274,18 +274,43 @@
         return result;
     }
 
-    function flattenConfigValues(value, path = '', output = []) {
-        if (output.length > 500 || value == null) return output;
+    function isConfigPathHint(path) {
+        return /(?:^|[.\[])(?:api|base(?:url)?|url|uri|host|origin|endpoint|gateway|route|path|service|config|env)(?:$|[.\]])/i.test(String(path || ''));
+    }
+
+    function addConfigEvidence(output, value, path) {
+        const normalized = String(value || '').trim().replace(/[),;]+$/, '');
+        if (!normalized || normalized.length > 4000) return;
+        if (!/^(?:https?:\/\/|\/)/i.test(normalized)) return;
+        if (!/^https?:\/\//i.test(normalized) &&
+            !/\/(?:api|meta|rest|openapi|graphql|rpc|gateway|service|auth|login|oauth|sso|v\d+)(?:\/|[?#]|$)/i.test(normalized) &&
+            !isConfigPathHint(path)) return;
+        if (!output.some(item => item.value === normalized && item.path === path)) output.push({ value: normalized, path });
+    }
+
+    function flattenConfigValues(value, path = '', output = [], depth = 0) {
+        if (output.length >= 1000 || value == null || depth > 8) return output;
         if (typeof value === 'string') {
-            if (/^(?:https?:\/\/|\/)[^\s]{1,1000}$/i.test(value)) output.push({ value, path });
+            const trimmed = value.trim();
+            if (/^[{[]/.test(trimmed)) {
+                try {
+                    const parsed = JSON.parse(trimmed);
+                    if (parsed && typeof parsed === 'object') flattenConfigValues(parsed, path, output, depth + 1);
+                } catch (_) {}
+            }
+            addConfigEvidence(output, trimmed, path);
+            for (const match of trimmed.matchAll(/https?:\/\/[^\s"'`<>\\]{4,4000}/gi)) addConfigEvidence(output, match[0], path);
+            for (const match of trimmed.matchAll(/(?<![:/])\/(?:api|meta|rest|openapi|graphql|rpc|gateway|service|auth|login|oauth|sso|v\d+)(?:\/[A-Za-z0-9_?&=.%{}:@+-]+){0,12}/gi)) {
+                addConfigEvidence(output, match[0], path);
+            }
             return output;
         }
         if (Array.isArray(value)) {
-            value.slice(0, 100).forEach((item, index) => flattenConfigValues(item, `${path}[${index}]`, output));
+            value.slice(0, 300).forEach((item, index) => flattenConfigValues(item, `${path}[${index}]`, output, depth + 1));
             return output;
         }
         if (typeof value === 'object') {
-            Object.entries(value).slice(0, 200).forEach(([key, item]) => flattenConfigValues(item, path ? `${path}.${key}` : key, output));
+            Object.entries(value).slice(0, 500).forEach(([key, item]) => flattenConfigValues(item, path ? `${path}.${key}` : key, output, depth + 1));
         }
         return output;
     }
@@ -294,11 +319,12 @@
         const evidence = [];
         for (const trace of storageTraces || []) {
             const value = String(trace.value || '');
-            if (/^(?:https?:\/\/|\/)[^\s]{1,1000}$/i.test(value)) {
+            const source = `${trace.storage || 'storage'}.${trace.key || '?'}`;
+            for (const item of flattenConfigValues(value, source)) {
                 evidence.push({
-                    value,
+                    value: item.value,
                     type: 'storage',
-                    source: `${trace.storage || 'storage'}.${trace.key || '?'}`,
+                    source: item.path || source,
                     capturedAt: trace.capturedAt || 0,
                     stack: trace.stack || ''
                 });
@@ -418,6 +444,7 @@
         endpointKey,
         normalizePath,
         inferSplit,
+        flattenConfigValues,
         buildEndpointIntelligence
     };
 })(typeof self !== 'undefined' ? self : globalThis);

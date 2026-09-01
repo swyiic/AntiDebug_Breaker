@@ -154,6 +154,7 @@
                         <button class="analysis-workbench-tab active" data-workbench-tab="network">请求 <span id="network-tab-count">0</span></button>
                         <button class="analysis-workbench-tab" data-workbench-tab="endpoints">接口重组</button>
                         <button class="analysis-workbench-tab" data-workbench-tab="javascript">JS 证据</button>
+                        <button class="analysis-workbench-tab" data-workbench-tab="discovery">候选 <span id="discovery-tab-count">0</span></button>
                         <button class="analysis-workbench-tab" data-workbench-tab="security">安全</button>
                         <button class="analysis-workbench-tab" data-workbench-tab="resources">资源</button>
                         <button class="analysis-workbench-tab" data-workbench-tab="routes">路由</button>
@@ -218,6 +219,18 @@
                                 <div><strong>JS 证据与静态候选</strong><span id="static-api-count">尚未分析</span></div>
                             </div>
                             <div id="static-api-list" class="api-analysis-list"><div class="analysis-empty">自动提取 baseURL、Storage、相对路径和请求调用；未被 Network 验证的内容不会拼成真实 URL</div></div>
+                        </div>
+                        <div class="endpoint-discovery-card workbench-section" data-workbench-section="discovery">
+                            <div class="security-analysis-header discovery-header">
+                                <div><strong>自动接口候选与存活验证</strong><span id="api-discovery-count">等待 JS 证据模型</span></div>
+                                <div class="discovery-actions">
+                                    <label>上限 <input id="api-probe-limit" type="number" min="1" max="200" value="80"></label>
+                                    <button id="probe-api-candidates" title="仅发送 HEAD；保留当前站点 Cookie 和已识别的自定义/鉴权请求头">HEAD 安全探测</button>
+                                    <button id="clear-api-probes">清空结果</button>
+                                </div>
+                            </div>
+                            <div class="discovery-note">只组合有来源关系的 Origin、端口、Base URL、API 前缀和调用路径；不会把所有字符串与所有域名乱拼。危险方法仅展示原始 Method，探测统一使用 HEAD。</div>
+                            <div id="api-discovery-list" class="api-analysis-list"><div class="analysis-empty">完成 JS 自动分析后展示请求客户端、候选接口、参数形状和证据链</div></div>
                         </div>
                         <div class="security-analysis-card workbench-section" data-workbench-section="security">
                             <div class="security-analysis-header">
@@ -417,9 +430,9 @@
   "mcpServers": {
     "AntiDebug_Breaker_mcp": {
       "command": "node",
-      "args": ["/path/to/mcp-server/dist/index.js"],
+      "args": ["/Users/swyiic/Desktop/Code/AntiDebug_Breaker/mcp-server/dist/index.js"],
       "env": {
-        "MCP_PORT": "9527",
+        "MCP_PORT": "1719"
       }
     }
   }

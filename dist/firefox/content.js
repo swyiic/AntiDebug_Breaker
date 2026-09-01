@@ -164,14 +164,15 @@
     const apiMonitorBridgeToken = `adb_${Date.now()}_${Math.random().toString(36).slice(2)}`;
 
     function syncApiMonitorConfig() {
-        chrome.storage.local.get(['auto_api_analysis_enabled', 'api_interaction_window_ms'], (result) => {
+        chrome.storage.local.get(['auto_api_analysis_enabled', 'api_interaction_window_ms', 'api_response_preview_limit'], (result) => {
             window.postMessage({
                 source: 'antidebug-extension',
                 type: 'ADB_MONITOR_CONFIG',
                 bridgeToken: apiMonitorBridgeToken,
                 config: {
                     enabled: result.auto_api_analysis_enabled !== false,
-                    interactionWindowMs: result.api_interaction_window_ms || 4000
+                    interactionWindowMs: result.api_interaction_window_ms || 4000,
+                    responseLimit: result.api_response_preview_limit || 100000
                 }
             }, '*');
         });
@@ -181,7 +182,7 @@
     document.addEventListener('readystatechange', syncApiMonitorConfig, { once: true });
 
     chrome.storage.onChanged.addListener((changes, area) => {
-        if (area === 'local' && (changes.auto_api_analysis_enabled || changes.api_interaction_window_ms)) {
+        if (area === 'local' && (changes.auto_api_analysis_enabled || changes.api_interaction_window_ms || changes.api_response_preview_limit)) {
             syncApiMonitorConfig();
         }
     });

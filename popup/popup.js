@@ -71,7 +71,7 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             
             if (response) {
-                const { connected, enabled, error, connecting, port, reconnectAttempts, maxReconnectAttempts } = response;
+                const { connected, enabled, error, connecting, retrying, port, reconnectAttempts, nextReconnectAt } = response;
                 
                 if (mcpIndicator) {
                     mcpIndicator.classList.remove('connected', 'error', 'connecting');
@@ -103,8 +103,8 @@ document.addEventListener('DOMContentLoaded', () => {
                         mcpStatusText.textContent = '状态：连接中...';
                         mcpStatusText.classList.add('status-connecting');
                     } else {
-                        // 正在尝试重连
-                        const attemptsInfo = reconnectAttempts > 0 ? ` (${reconnectAttempts}/${maxReconnectAttempts})` : '';
+                        const seconds = nextReconnectAt ? Math.max(0, Math.ceil((nextReconnectAt - Date.now()) / 1000)) : 0;
+                        const attemptsInfo = reconnectAttempts > 0 ? `（第 ${reconnectAttempts} 次${retrying ? `，约 ${seconds} 秒后重试` : ''}）` : '';
                         mcpStatusText.textContent = `状态：等待连接${attemptsInfo}`;
                         mcpStatusText.classList.add('status-connecting');
                     }
@@ -323,6 +323,12 @@ document.addEventListener('DOMContentLoaded', () => {
     const analyzePageJsBtn = document.getElementById('analyze-page-js');
     const staticApiCount = document.getElementById('static-api-count');
     const staticApiList = document.getElementById('static-api-list');
+    const apiDiscoveryCount = document.getElementById('api-discovery-count');
+    const apiDiscoveryList = document.getElementById('api-discovery-list');
+    const discoveryTabCount = document.getElementById('discovery-tab-count');
+    const probeApiCandidatesBtn = document.getElementById('probe-api-candidates');
+    const clearApiProbesBtn = document.getElementById('clear-api-probes');
+    const apiProbeLimit = document.getElementById('api-probe-limit');
     const sessionSnapshotName = document.getElementById('session-snapshot-name');
     const saveSessionSnapshotBtn = document.getElementById('save-session-snapshot');
     const sessionSnapshotList = document.getElementById('session-snapshot-list');
@@ -359,6 +365,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let activeWorkbenchSection = localStorage.getItem('antidebug_workbench_section') || 'network';
     let latestApiAnalysis = null;
     let latestStaticAnalysis = null;
+    let latestProbeResults = null;
     let latestHeaderIntelligence = null;
     let sessionSnapshots = [];
 
@@ -412,6 +419,9 @@ document.addEventListener('DOMContentLoaded', () => {
         });
         (evidence.businessPaths || []).forEach(item => {
             if (priorityPattern.test(item.value || '')) priorityItems.push({ value: item.value, reason: 'JS 中的高价值路径证据', target: 'javascript' });
+        });
+        (latestStaticAnalysis?.discovery?.candidates || []).filter(item => !item.confirmedByNetwork).forEach(candidate => {
+            if (priorityPattern.test(candidate.url || '')) priorityItems.push({ value: candidate.url, reason: '已重组、尚未验证的高价值接口', target: 'discovery' });
         });
         const dedupedPriority = [...new Map(priorityItems.map(item => [item.value, item])).values()];
         const metrics = {
@@ -679,39 +689,114 @@ document.addEventListener('DOMContentLoaded', () => {
         }).join('');
     }
 
+    function renderDiscoveryAnalysis(analysis, probeState = latestProbeResults) {
+        const discovery = analysis?.discovery || { clients: [], candidates: [], unresolved: [], stats: {} };
+        const clients = discovery.clients || [];
+        const candidates = discovery.candidates || [];
+        const unresolved = discovery.unresolved || [];
+        const resultMap = new Map((probeState?.results || []).map(result => [`${result.originalMethod} ${result.url}`, result]));
+        const unconfirmed = candidates.filter(candidate => !candidate.confirmedByNetwork);
+        const alive = [...resultMap.values()].filter(result => ['alive', 'exists-auth', 'exists-method', 'exists-params', 'redirect-auth'].includes(result.state)).length;
+        if (discoveryTabCount) discoveryTabCount.textContent = String(unconfirmed.length);
+        if (apiDiscoveryCount) {
+            const progress = probeState?.status === 'running' ? ` · 探测 ${probeState.completed || 0}/${probeState.total || 0}` : '';
+            apiDiscoveryCount.textContent = `${clients.length} 个客户端 · ${candidates.length} 个候选 · ${unconfirmed.length} 个待验证 · ${alive} 个探测存活${progress}`;
+        }
+        if (probeApiCandidatesBtn) {
+            probeApiCandidatesBtn.disabled = probeState?.status === 'running' || !unconfirmed.length;
+            probeApiCandidatesBtn.textContent = probeState?.status === 'running' ? `探测中 ${probeState.completed || 0}/${probeState.total || 0}` : 'HEAD 安全探测';
+        }
+        if (!apiDiscoveryList) return;
+        if (analysis?.status === 'running') {
+            apiDiscoveryList.innerHTML = '<div class="analysis-empty">正在构建 Origin、端口、Base URL、API 前缀、调用点和参数之间的证据关系…</div>';
+            return;
+        }
+        if (!clients.length && !candidates.length) {
+            apiDiscoveryList.innerHTML = `<div class="analysis-empty">${escapeAnalysisText(analysis?.error || '没有足够证据建立请求客户端和候选接口')}</div>`;
+            return;
+        }
+        const clientHtml = clients.map(client => {
+            const rows = candidates.filter(candidate => candidate.clientId === client.id).slice(0, 300);
+            const sources = (client.sources || []).slice(0, 12).map(source => `${source.type || '证据'} · ${source.source || ''} · ${source.value || ''}`).join('\n');
+            return `<details class="discovery-client" open>
+                <summary><strong>${escapeAnalysisText(client.baseUrl)}</strong><span>${escapeAnalysisText(client.protocol)} · ${escapeAnalysisText(client.hostname)}:${escapeAnalysisText(client.port)} · ${rows.length} 条 · ${Math.round((client.confidence || 0) * 100)}%</span></summary>
+                <div class="discovery-client-evidence">${escapeAnalysisText(sources || 'window.location')}</div>
+                ${rows.map(candidate => {
+                    const probe = resultMap.get(`${candidate.method} ${candidate.url}`);
+                    const state = candidate.confirmedByNetwork ? { state: 'alive', label: 'Network 已验证' } : probe || { state: 'pending', label: '待验证' };
+                    const details = {
+                        urlExpression: candidate.urlExpression || '',
+                        rawPath: candidate.rawPath,
+                        fields: candidate.fields || [],
+                        requestShape: candidate.requestShape || [],
+                        headers: candidate.headers || {},
+                        inferredHeaders: candidate.inferredHeaders || [],
+                        bodyExpression: candidate.bodyExpression || '',
+                        callExpression: candidate.callExpression || '',
+                        sourceContext: {
+                            before: candidate.before || '',
+                            after: candidate.after || ''
+                        },
+                        evidence: candidate.evidence || [],
+                        probe: probe || null
+                    };
+                    return `<div class="discovery-candidate">
+                        <input class="probe-candidate-checkbox" type="checkbox" data-candidate-id="${escapeAnalysisText(candidate.id)}" ${candidate.confirmedByNetwork ? 'disabled' : 'checked'} title="选择进行 HEAD 探测">
+                        <span class="api-method ${escapeAnalysisText(candidate.method)}">${escapeAnalysisText(candidate.method)}</span>
+                        <details class="api-detail"><summary><code>${escapeAnalysisText(candidate.url)}</code><small>原始 ${escapeAnalysisText(candidate.rawPath)} · 可信度 ${Math.round((candidate.confidence || 0) * 100)}%</small></summary><div class="api-detail-body"><pre>${escapeAnalysisText(JSON.stringify(details, null, 2))}</pre></div></details>
+                        <span class="probe-state ${escapeAnalysisText(state.state)}">${escapeAnalysisText(state.label)}</span>
+                    </div>`;
+                }).join('')}
+            </details>`;
+        }).join('');
+        const unresolvedHtml = unresolved.length ? `<details class="discovery-client"><summary><strong>未重组路径</strong><span>${unresolved.length} 条，缺少关联 Base URL</span></summary>${unresolved.slice(0, 300).map(item => `<div class="static-evidence-row"><code>${escapeAnalysisText(item.method)} ${escapeAnalysisText(item.rawPath)}</code><span>${escapeAnalysisText(item.source)} · ${escapeAnalysisText(item.reason)}</span></div>`).join('')}</details>` : '';
+        apiDiscoveryList.innerHTML = clientHtml + unresolvedHtml;
+    }
+
     function renderStaticApiAnalysis(analysis) {
         latestStaticAnalysis = analysis || latestStaticAnalysis;
+        renderDiscoveryAnalysis(latestStaticAnalysis);
         renderAttackSurfaceOverview();
         const endpoints = analysis?.endpoints || [];
         const stringEvidence = analysis?.stringEvidence || { baseUrls: [], apiPrefixes: [], businessPaths: [], storageReferences: [] };
+        const scriptDiagnostics = analysis?.scriptDiagnostics || [];
+        const failedScripts = scriptDiagnostics.filter(item => !item.analyzed);
         const evidenceTotal = Object.values(stringEvidence).reduce((sum, items) => sum + (Array.isArray(items) ? items.length : 0), 0);
         if (staticApiCount) staticApiCount.textContent = analysis?.status === 'running'
             ? '后台分析中…'
             : analysis?.error
             ? `失败：${analysis.error}`
-            : `${evidenceTotal} 条字符串证据 · ${endpoints.length} 个静态候选 · ${analysis?.astEngine || '本地证据引擎'} · ${analysis?.scriptsAnalyzed || 0}/${analysis?.scriptsDiscovered || 0} 个脚本${analysis?.documentAnalyzed ? ' · 含页面' : ''}`;
+            : `${evidenceTotal} 条字符串证据 · ${endpoints.length} 个静态候选 · ${analysis?.astEngine || '本地证据引擎'} · ${analysis?.scriptsAnalyzed || 0}/${analysis?.scriptsDiscovered || 0} 个去重脚本${failedScripts.length ? ` · 失败 ${failedScripts.length}` : ''}${analysis?.scriptsReferenced > analysis?.scriptsDiscovered ? ` · ${analysis.scriptsReferenced} 次资源引用` : ''}${analysis?.documentAnalyzed ? ' · 含页面' : ''}`;
         if (!staticApiList) return;
         if (analysis?.status === 'running') {
             staticApiList.innerHTML = '<div class="analysis-empty">正在后台读取 main / app / index / portal / chunk 等脚本，关闭 popup 也不会中断…</div>';
             return;
         }
-        if (!endpoints.length && !evidenceTotal) {
+        if (!endpoints.length && !evidenceTotal && !scriptDiagnostics.length) {
             staticApiList.innerHTML = `<div class="analysis-empty">${escapeAnalysisText(analysis?.error || '没有从当前 JS 中还原出接口')}</div>`;
             return;
         }
         const evidenceLabels = { baseUrls: 'Base URL / 配置值', apiPrefixes: 'API 前缀', businessPaths: '未验证路径字符串（不等于接口）', storageReferences: 'Storage 引用键' };
+        const diagnosticsHtml = scriptDiagnostics.length ? `
+            <details class="static-evidence-group" ${failedScripts.length ? 'open' : ''}>
+                <summary><strong>脚本读取诊断</strong><span>${scriptDiagnostics.length} 个去重脚本 · ${failedScripts.length} 个失败</span></summary>
+                ${scriptDiagnostics.slice(0, 300).map(item => `<div class="static-evidence-row"><code>${escapeAnalysisText(item.source)}</code><span>${item.analyzed ? `已分析 ${(item.bytesAnalyzed || 0).toLocaleString()} 字符` : `失败：${escapeAnalysisText(item.error || `HTTP ${item.status || 0}`)}`} · ${escapeAnalysisText(item.discoveredBy || '')}${item.status ? ` · ${escapeAnalysisText(item.status)}` : ''}</span></div>`).join('')}
+            </details>` : '';
         const evidenceHtml = Object.entries(stringEvidence).filter(([, items]) => items?.length).map(([kind, items]) => `
             <details class="static-evidence-group" ${kind === 'baseUrls' || kind === 'apiPrefixes' ? 'open' : ''}>
                 <summary><strong>${escapeAnalysisText(evidenceLabels[kind] || kind)}</strong><span class="static-evidence-actions"><span>${items.length}</span><button type="button" class="copy-all-evidence" data-evidence-kind="${escapeAnalysisText(kind)}">复制全部</button></span></summary>
                 ${items.slice(0, 160).map(item => `<div class="static-evidence-row"><code>${escapeAnalysisText(item.value)}</code><span>${escapeAnalysisText(item.source || '')}${item.line ? `:${item.line}` : ''}</span></div>`).join('')}
             </details>`).join('');
-        staticApiList.innerHTML = evidenceHtml + endpoints.slice(0, 150).map(endpoint => `
+        staticApiList.innerHTML = diagnosticsHtml + evidenceHtml + endpoints.slice(0, 150).map(endpoint => `
             <div class="api-analysis-item static-endpoint-item">
                 <span class="api-method ${escapeAnalysisText(endpoint.method)}">${escapeAnalysisText(endpoint.method)}</span>
                 <details class="api-detail">
                     <summary><strong class="api-full-url">${escapeAnalysisText(endpoint.fullUrl)}</strong><span class="api-split">${endpoint.confirmedByNetwork ? 'Network 已验证' : '静态候选，未重组'} · 原始片段 ${escapeAnalysisText(endpoint.rawUrl)} · 可信度 ${Math.round((endpoint.confidence || 0) * 100)}%</span></summary>
                     <div class="api-detail-body">
                         <div class="api-detail-row"><b>识别依据</b><pre>${escapeAnalysisText(endpoint.evidence)} · ${escapeAnalysisText(endpoint.source)}:${endpoint.line || '?'}</pre></div>
+                        <div class="api-detail-row"><b>原始调用</b><pre>${escapeAnalysisText(endpoint.callExpression || endpoint.urlExpression || endpoint.rawUrl || '')}</pre></div>
+                        <div class="api-detail-row"><b>源码前文</b><pre>${escapeAnalysisText(endpoint.before || '无')}</pre></div>
+                        <div class="api-detail-row"><b>源码后文</b><pre>${escapeAnalysisText(endpoint.after || '无')}</pre></div>
                         <div class="api-detail-row"><b>附近请求字段</b><pre>${escapeAnalysisText(JSON.stringify(endpoint.fields || [], null, 2))}</pre></div>
                     </div>
                 </details>
@@ -788,6 +873,16 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     let staticAnalysisPollTimer = null;
+    let probePollTimer = null;
+
+    async function loadProbeResults() {
+        if (!currentTab_obj?.id) return;
+        clearTimeout(probePollTimer);
+        latestProbeResults = await chrome.runtime.sendMessage({ type: 'GET_API_PROBE_RESULTS', tabId: currentTab_obj.id }).catch(error => ({ status: 'error', error: error.message, results: [] }));
+        renderDiscoveryAnalysis(latestStaticAnalysis, latestProbeResults);
+        if (latestProbeResults?.status === 'running') probePollTimer = setTimeout(loadProbeResults, 700);
+    }
+
     async function pollStaticAnalysis() {
         if (!currentTab_obj?.id) return;
         clearTimeout(staticAnalysisPollTimer);
@@ -801,6 +896,7 @@ document.addEventListener('DOMContentLoaded', () => {
             analyzePageJsBtn.disabled = false;
             analyzePageJsBtn.textContent = '重新分析 JS';
             loadApiAnalysis();
+            loadProbeResults();
         }
     }
 
@@ -826,7 +922,7 @@ document.addEventListener('DOMContentLoaded', () => {
     async function loadStaticApiAnalysis() {
         if (!currentTab_obj?.id) return;
         const analysis = await chrome.runtime.sendMessage({ type: 'GET_STATIC_API_ANALYSIS', tabId: currentTab_obj.id }).catch(error => ({ status: 'error', error: error.message }));
-        if ((analysis?.analysisVersion !== 7 || !analysis?.analyzedAt) && analysis?.status !== 'running' && !analysis?.error) return startStaticAnalysis();
+        if ((analysis?.analysisVersion !== 13 || !analysis?.analyzedAt) && analysis?.status !== 'running' && !analysis?.error) return startStaticAnalysis();
         renderStaticApiAnalysis(analysis);
         renderSecurityAnalysis(analysis);
         renderResourceInventory(analysis);
@@ -840,6 +936,7 @@ document.addEventListener('DOMContentLoaded', () => {
         loadFrontendAnalysis();
         loadApiAnalysis();
         loadStaticApiAnalysis();
+        loadProbeResults();
         loadSessionSnapshots();
     }
 
@@ -857,12 +954,36 @@ document.addEventListener('DOMContentLoaded', () => {
         showToast('接口记录已清空');
     });
     analyzePageJsBtn?.addEventListener('click', startStaticAnalysis);
+    probeApiCandidatesBtn?.addEventListener('click', async () => {
+        if (!currentTab_obj?.id) return;
+        const candidateIds = [...document.querySelectorAll('.probe-candidate-checkbox:checked')].map(input => input.dataset.candidateId).filter(Boolean);
+        probeApiCandidatesBtn.disabled = true;
+        const response = await chrome.runtime.sendMessage({
+            type: 'PROBE_API_CANDIDATES',
+            tabId: currentTab_obj.id,
+            options: { candidateIds, limit: Number(apiProbeLimit?.value) || 80, concurrency: 3, timeoutMs: 10000, intervalMs: 180 }
+        }).catch(error => ({ accepted: false, error: error.message }));
+        if (!response?.accepted) {
+            probeApiCandidatesBtn.disabled = false;
+            showToast(response?.error || '无法启动候选探测');
+            return;
+        }
+        showToast(`已启动 ${response.total || candidateIds.length} 条 HEAD 安全探测`);
+        loadProbeResults();
+    });
+    clearApiProbesBtn?.addEventListener('click', async () => {
+        if (!currentTab_obj?.id) return;
+        await chrome.runtime.sendMessage({ type: 'CLEAR_API_PROBE_RESULTS', tabId: currentTab_obj.id });
+        latestProbeResults = { status: 'idle', results: [] };
+        renderDiscoveryAnalysis(latestStaticAnalysis, latestProbeResults);
+        showToast('候选探测结果已清空');
+    });
     autoApiAnalysisToggle?.addEventListener('change', event => {
         chrome.storage.local.set({ auto_api_analysis_enabled: event.target.checked });
         showToast(event.target.checked ? '自动接口分析已开启' : '自动接口分析已关闭');
     });
 
-    const DEFAULT_EXCLUDED_SITES = ['w3.org', 'w3c.org', 'schema.org', 'google-analytics.com', 'googletagmanager.com', 'doubleclick.net', 'adtrafficquality.google', 'cloudflareinsights.com'];
+    const DEFAULT_EXCLUDED_SITES = ['w3.org', 'w3c.org', 'schema.org', 'google-analytics.com', 'googletagmanager.com', 'doubleclick.net', 'adtrafficquality.google', 'cloudflareinsights.com', 'tongji-collector.dcloud.net.cn'];
     const securityCount = document.getElementById('security-analysis-count');
     const cryptoSummary = document.getElementById('crypto-analysis-summary');
     const excludedSitesInput = document.getElementById('excluded-sites-input');
@@ -1172,10 +1293,17 @@ document.addEventListener('DOMContentLoaded', () => {
             clearTimeout(staticAnalysisPollTimer);
             renderStaticApiAnalysis(message.data);
             renderSecurityAnalysis(message.data);
+            renderResourceInventory(message.data);
+            loadProbeResults();
             if (analyzePageJsBtn) {
                 analyzePageJsBtn.disabled = false;
                 analyzePageJsBtn.textContent = '重新分析 JS';
             }
+        }
+
+        if (message.type === 'API_PROBE_UPDATE' && message.tabId === currentTab_obj?.id) {
+            latestProbeResults = message.data;
+            renderDiscoveryAnalysis(latestStaticAnalysis, latestProbeResults);
         }
 
         if (message.type === 'VUE_ROUTER_DATA_UPDATE' && message.hostname === hostname) {

@@ -21,6 +21,7 @@ const rootFiles = [
     'api-analyzer.js',
     'background.js',
     'content.js',
+    'discovery-engine.js',
     'firefox-compat.js',
     'mcp-client.js',
     'scripts.json'

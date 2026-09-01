@@ -1,10 +1,11 @@
 {
   "name": "AntiDebug Breaker",
-  "version": "3.5.3",
+  "version": "3.6.0",
   "description": "AntiDebug Breaker 三开 - Firefox 版",
   "manifest_version": 3,
   "permissions": [
     "storage",
+    "unlimitedStorage",
     "scripting",
     "activeTab",
     "tabs",
@@ -21,6 +22,7 @@
     "scripts": [
       "firefox-compat.js",
       "api-analyzer.js",
+      "discovery-engine.js",
       "mcp-client.js",
       "background.js"
     ],

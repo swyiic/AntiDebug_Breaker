@@ -11,10 +11,11 @@
     const state = {
         enabled: true,
         interactionWindowMs: 4000,
-        responseLimit: 50000,
+        responseLimit: 100000,
         sequence: 0,
         lastInteraction: null,
-        bridgeToken: null
+        bridgeToken: null,
+        storageSnapshotEmitted: false
     };
     window[INSTALL_KEY] = state;
 
@@ -135,37 +136,76 @@
             if (typeof event.data.bridgeToken === 'string') state.bridgeToken = event.data.bridgeToken;
             if (typeof config.enabled === 'boolean') state.enabled = config.enabled;
             if (Number.isFinite(config.interactionWindowMs)) state.interactionWindowMs = Math.max(500, Math.min(15000, config.interactionWindowMs));
+            if (Number.isFinite(config.responseLimit)) state.responseLimit = Math.max(10000, Math.min(500000, config.responseLimit));
+            setTimeout(emitInitialStorageSnapshot, 0);
         }
     });
 
     // 记录运行时配置的来源。这里只观察字符串边界，不修改页面实际存储值。
     const originalStorageSetItem = Storage.prototype.setItem;
     const originalStorageGetItem = Storage.prototype.getItem;
+    const storageKeyHint = /(?:api|base|url|uri|host|origin|endpoint|gateway|route|path|service|config|env)/i;
+    const storageValueHint = /https?:\/\/|\/(?:api|meta|rest|openapi|graphql|rpc|gateway|service|auth|login|oauth|sso|v\d+)(?:\/|[?#]|$)/i;
+    const isRelevantStorageValue = (key, value) => value != null && (
+        storageKeyHint.test(String(key || '')) ||
+        storageValueHint.test(String(value || ''))
+    );
+
+    function emitStorageSnapshot(storageArea, storageName) {
+        let emitted = 0;
+        try {
+            for (let index = 0; index < storageArea.length && emitted < 1000; index += 1) {
+                const key = storageArea.key(index);
+                const value = key == null ? null : originalStorageGetItem.call(storageArea, key);
+                if (!isRelevantStorageValue(key, value)) continue;
+                post('ADB_STORAGE_TRACE', {
+                    operation: 'snapshot',
+                    storage: storageName,
+                    key: String(key),
+                    value: String(value).slice(0, 50000),
+                    pageUrl: location.href,
+                    capturedAt: Date.now(),
+                    stack: ''
+                });
+                emitted += 1;
+            }
+        } catch (_) {}
+    }
+
+    function emitInitialStorageSnapshot() {
+        if (!state.enabled || !state.bridgeToken || state.storageSnapshotEmitted) return;
+        state.storageSnapshotEmitted = true;
+        emitStorageSnapshot(localStorage, 'localStorage');
+        emitStorageSnapshot(sessionStorage, 'sessionStorage');
+    }
+
     Storage.prototype.setItem = function (key, value) {
         const result = originalStorageSetItem.apply(this, arguments);
         let storage = 'storage';
         try { storage = this === localStorage ? 'localStorage' : this === sessionStorage ? 'sessionStorage' : storage; } catch (_) {}
-        post('ADB_STORAGE_TRACE', {
-            operation: 'set',
-            storage,
-            key: String(key),
-            value: String(value).slice(0, 12000),
-            pageUrl: location.href,
-            capturedAt: Date.now(),
-            stack: new Error().stack?.split('\n').slice(2, 9).join('\n') || ''
-        });
+        if (isRelevantStorageValue(key, value)) {
+            post('ADB_STORAGE_TRACE', {
+                operation: 'set',
+                storage,
+                key: String(key),
+                value: String(value).slice(0, 50000),
+                pageUrl: location.href,
+                capturedAt: Date.now(),
+                stack: new Error().stack?.split('\n').slice(2, 9).join('\n') || ''
+            });
+        }
         return result;
     };
     Storage.prototype.getItem = function (key) {
         const value = originalStorageGetItem.apply(this, arguments);
         let storage = 'storage';
         try { storage = this === localStorage ? 'localStorage' : this === sessionStorage ? 'sessionStorage' : storage; } catch (_) {}
-        if (value != null && /^(?:https?:\/\/|\/)[^\s]{1,1000}$/i.test(String(value))) {
+        if (isRelevantStorageValue(key, value)) {
             post('ADB_STORAGE_TRACE', {
                 operation: 'get',
                 storage,
                 key: String(key),
-                value: String(value).slice(0, 12000),
+                value: String(value).slice(0, 50000),
                 pageUrl: location.href,
                 capturedAt: Date.now(),
                 stack: new Error().stack?.split('\n').slice(2, 9).join('\n') || ''
@@ -173,6 +213,9 @@
         }
         return value;
     };
+
+    // Hook 安装前已经存在的运行时配置也必须参与接口重组。
+    setTimeout(emitInitialStorageSnapshot, 0);
 
     const originalOpen = XMLHttpRequest.prototype.open;
     const originalSend = XMLHttpRequest.prototype.send;

@@ -2,12 +2,13 @@
 // Chrome 使用 Service Worker，需要主动载入依赖；Firefox 的事件页由 manifest
 // 按顺序载入这些脚本，没有 importScripts。
 if (typeof importScripts === 'function') {
-    importScripts('firefox-compat.js', 'api-analyzer.js', 'mcp-client.js');
+    importScripts('firefox-compat.js', 'api-analyzer.js', 'discovery-engine.js', 'mcp-client.js');
 }
 
 // ====== 脚本注册管理 ====== //
 const scriptRegistry = new Map(); // 存储: [hostname|scriptId] => 注册ID
 let isInitialized = false;
+let scriptRegistryInitialization = null;
 
 // 🆕 全局模式存储键名
 const GLOBAL_MODE_KEY = 'antidebug_mode';
@@ -186,14 +187,115 @@ const AUTO_FRAMEWORK_ENABLED_KEY = 'auto_frontend_detection_enabled';
 const API_STORAGE_PREFIX = 'api_analysis_tab_';
 const STATIC_API_STORAGE_PREFIX = 'static_api_analysis_tab_';
 const API_STORAGE_TRACE_PREFIX = 'api_storage_trace_tab_';
+const FRONTEND_ANALYSIS_STORAGE_PREFIX = 'frontend_analysis_tab_';
+const API_PROBE_STORAGE_PREFIX = 'api_probe_results_tab_';
+const API_REQUEST_LIMIT = 1000;
+const API_STORAGE_TRACE_LIMIT = 1000;
 const apiBadgeTimers = new Map();
 const networkRequestTabs = new Map();
+const tabCacheWriteQueues = new Map();
+let analysisCacheMaintenance = null;
 let autoApiCaptureEnabled = true;
-chrome.storage.local.get([AUTO_API_ENABLED_KEY], result => {
+const DEFAULT_ANALYSIS_EXCLUDED_DOMAINS = ['w3.org', 'w3c.org', 'schema.org', 'google-analytics.com', 'googletagmanager.com', 'doubleclick.net', 'adtrafficquality.google', 'cloudflareinsights.com', 'tongji-collector.dcloud.net.cn'];
+let analysisExcludedDomains = new Set(DEFAULT_ANALYSIS_EXCLUDED_DOMAINS);
+
+function updateAnalysisExcludedDomains(custom = []) {
+    analysisExcludedDomains = new Set([...DEFAULT_ANALYSIS_EXCLUDED_DOMAINS, ...(Array.isArray(custom) ? custom : [])]
+        .map(value => String(value || '').trim().toLowerCase()).filter(Boolean));
+}
+
+function isExcludedApiNoise(request) {
+    try {
+        const parsed = new URL(request?.url || request?.rawUrl);
+        if ([...analysisExcludedDomains].some(domain => parsed.hostname === domain || parsed.hostname.endsWith(`.${domain}`))) return true;
+        return /\/(?:gen_204|log|collect|analytics|telemetry|rum|beacon)(?:[/?]|$)/i.test(parsed.pathname) && request?.transport === 'beacon';
+    } catch (_) { return false; }
+}
+
+function cachedTabId(key, prefix) {
+    if (!key.startsWith(prefix)) return null;
+    const tabId = Number(key.slice(prefix.length));
+    return Number.isInteger(tabId) && tabId >= 0 ? tabId : null;
+}
+
+function analysisCacheTabId(key) {
+    for (const prefix of [API_STORAGE_PREFIX, STATIC_API_STORAGE_PREFIX, API_STORAGE_TRACE_PREFIX, FRONTEND_ANALYSIS_STORAGE_PREFIX, API_PROBE_STORAGE_PREFIX]) {
+        const tabId = cachedTabId(key, prefix);
+        if (tabId != null) return tabId;
+    }
+    return null;
+}
+
+function compactStoredApiAnalysis(analysis, tabId) {
+    const requests = Array.isArray(analysis?.requests) ? analysis.requests.slice(0, API_REQUEST_LIMIT) : [];
+    // endpoints 可随时从 requests 重建，持久化两份完整请求会让每个 Tab 的体积近似翻倍。
+    const { endpoints: _discardedEndpoints, ...rest } = analysis || {};
+    return { ...rest, tabId, requests };
+}
+
+async function maintainAnalysisCache() {
+    if (analysisCacheMaintenance) return analysisCacheMaintenance;
+    analysisCacheMaintenance = (async () => {
+        const [tabs, stored] = await Promise.all([
+            chrome.tabs.query({}),
+            chrome.storage.local.get(null)
+        ]);
+        const liveTabIds = new Set(tabs.map(tab => tab.id).filter(Number.isInteger));
+        const removeKeys = [];
+        const updates = {};
+        for (const [key, value] of Object.entries(stored)) {
+            const tabId = analysisCacheTabId(key);
+            if (tabId == null) continue;
+            if (!liveTabIds.has(tabId)) {
+                removeKeys.push(key);
+                continue;
+            }
+            if (key.startsWith(API_STORAGE_PREFIX)) {
+                updates[key] = compactStoredApiAnalysis(value, tabId);
+            } else if (key.startsWith(API_STORAGE_TRACE_PREFIX) && Array.isArray(value) && value.length > API_STORAGE_TRACE_LIMIT) {
+                updates[key] = value.slice(0, API_STORAGE_TRACE_LIMIT);
+            }
+        }
+        // 先释放已关闭标签页的旧缓存，确保旧版本已经顶满配额时也能完成迁移。
+        if (removeKeys.length) await chrome.storage.local.remove(removeKeys);
+        if (Object.keys(updates).length) await chrome.storage.local.set(updates);
+        return { removed: removeKeys.length, compacted: Object.keys(updates).length };
+    })().finally(() => {
+        analysisCacheMaintenance = null;
+    });
+    return analysisCacheMaintenance;
+}
+
+async function writeAnalysisCache(key, value) {
+    try {
+        await chrome.storage.local.set({ [key]: value });
+    } catch (error) {
+        if (!/quota|kQuotaBytes/i.test(String(error?.message || error))) throw error;
+        await maintainAnalysisCache();
+        await chrome.storage.local.set({ [key]: value });
+    }
+}
+
+function enqueueTabCacheWrite(tabId, operation) {
+    const previous = tabCacheWriteQueues.get(tabId) || Promise.resolve();
+    const next = previous.catch(() => {}).then(operation);
+    tabCacheWriteQueues.set(tabId, next);
+    return next.finally(() => {
+        if (tabCacheWriteQueues.get(tabId) === next) tabCacheWriteQueues.delete(tabId);
+    });
+}
+
+maintainAnalysisCache().then(result => {
+    if (result.removed || result.compacted) console.info('[AntiDebug] 分析缓存维护完成:', result);
+}).catch(error => console.warn('[AntiDebug] 分析缓存维护失败:', error));
+chrome.storage.local.get([AUTO_API_ENABLED_KEY, 'analysis_excluded_sites'], result => {
     autoApiCaptureEnabled = result[AUTO_API_ENABLED_KEY] !== false;
+    updateAnalysisExcludedDomains(result.analysis_excluded_sites);
 });
 chrome.storage.onChanged.addListener((changes, area) => {
-    if (area === 'local' && changes[AUTO_API_ENABLED_KEY]) autoApiCaptureEnabled = changes[AUTO_API_ENABLED_KEY].newValue !== false;
+    if (area !== 'local') return;
+    if (changes[AUTO_API_ENABLED_KEY]) autoApiCaptureEnabled = changes[AUTO_API_ENABLED_KEY].newValue !== false;
+    if (changes.analysis_excluded_sites) updateAnalysisExcludedDomains(changes.analysis_excluded_sites.newValue);
 });
 
 function decodeWebRequestBody(requestBody) {
@@ -370,23 +472,28 @@ async function registerScripts(hostname, scriptIds, isGlobalMode = false) {
 // 初始化时清除所有旧注册
 async function initializeScriptRegistry() {
     if (isInitialized) return;
+    if (scriptRegistryInitialization) return scriptRegistryInitialization;
+    scriptRegistryInitialization = (async () => {
+        try {
+            // 清除所有旧注册。用单一 Promise 防止启动和安装事件并发注销同一个 ID。
+            const registered = await chrome.scripting.getRegisteredContentScripts();
+            const ourScripts = registered.filter(script => script.id.startsWith('ad_'));
 
-    try {
-        // 清除所有旧注册
-        const registered = await chrome.scripting.getRegisteredContentScripts();
-        const ourScripts = registered.filter(script => script.id.startsWith('ad_'));
+            if (ourScripts.length > 0) {
+                await chrome.scripting.unregisterContentScripts({
+                    ids: ourScripts.map(s => s.id)
+                });
+                // console.log('[AntiDebug] Cleared old script registrations');
+            }
 
-        if (ourScripts.length > 0) {
-            await chrome.scripting.unregisterContentScripts({
-                ids: ourScripts.map(s => s.id)
-            });
-            // console.log('[AntiDebug] Cleared old script registrations');
+            isInitialized = true;
+        } catch (error) {
+            console.error('[AntiDebug] Initialization failed:', error);
+        } finally {
+            scriptRegistryInitialization = null;
         }
-
-        isInitialized = true;
-    } catch (error) {
-        console.error('[AntiDebug] Initialization failed:', error);
-    }
+    })();
+    return scriptRegistryInitialization;
 }
 
 // ====== 初始化及原有徽章管理 ====== //
@@ -527,12 +634,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     if (message.type === 'AUTO_API_STORAGE_TRACE' && sender.tab) {
         const key = apiStorageTraceKey(sender.tab.id);
-        chrome.storage.local.get([key]).then(result => {
-            const traces = [
-                { ...message.data, tabId: sender.tab.id, frameId: sender.frameId ?? 0, capturedAt: message.data?.capturedAt || Date.now() },
-                ...(result[key] || [])
-            ].slice(0, 300);
-            return chrome.storage.local.set({ [key]: traces });
+        enqueueTabCacheWrite(sender.tab.id, async () => {
+            const result = await chrome.storage.local.get([key]);
+            const incoming = {
+                ...message.data,
+                value: String(message.data?.value || '').slice(0, 50000),
+                tabId: sender.tab.id,
+                frameId: sender.frameId ?? 0,
+                capturedAt: message.data?.capturedAt || Date.now()
+            };
+            const traces = [...(result[key] || [])];
+            const duplicateIndex = traces.findIndex(trace =>
+                trace.storage === incoming.storage && trace.key === incoming.key && trace.value === incoming.value
+            );
+            if (duplicateIndex >= 0) {
+                const previous = traces.splice(duplicateIndex, 1)[0];
+                traces.unshift({ ...previous, ...incoming, seenCount: (previous.seenCount || 1) + 1 });
+            } else {
+                traces.unshift({ ...incoming, seenCount: 1 });
+            }
+            traces.splice(API_STORAGE_TRACE_LIMIT);
+            await writeAnalysisCache(key, traces);
         }).then(() => sendResponse({ success: true })).catch(error => sendResponse({ success: false, error: error.message }));
         return true;
     }
@@ -542,7 +664,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             if (result[AUTO_FRAMEWORK_ENABLED_KEY] === false || !self.mcpClient?.detectFrontendStack) return;
             setTimeout(() => {
                 self.mcpClient.detectFrontendStack({ tabId: sender.tab.id }).then(analysis => {
-                    chrome.storage.local.set({ [`frontend_analysis_tab_${sender.tab.id}`]: analysis });
+                    writeAnalysisCache(`${FRONTEND_ANALYSIS_STORAGE_PREFIX}${sender.tab.id}`, analysis).catch(() => {});
                     chrome.runtime.sendMessage({ type: 'FRONTEND_ANALYSIS_UPDATE', tabId: sender.tab.id, data: analysis }).catch(() => {});
                 }).catch(() => {});
             }, 800);
@@ -585,6 +707,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             const stored = result[staticApiStorageKey(message.tabId)] || { endpoints: [], security: { algorithms: [], findings: [], urls: [] } };
             sendResponse({ ...stored, status: staticAnalysisJobs.has(message.tabId) ? 'running' : (stored.status || 'idle') });
         });
+        return true;
+    }
+
+    if (message.type === 'GET_API_PROBE_RESULTS') {
+        chrome.storage.local.get([apiProbeStorageKey(message.tabId)]).then(result => {
+            sendResponse(result[apiProbeStorageKey(message.tabId)] || { tabId: message.tabId, status: 'idle', results: [] });
+        }).catch(error => sendResponse({ tabId: message.tabId, status: 'error', error: error.message, results: [] }));
+        return true;
+    }
+
+    if (message.type === 'PROBE_API_CANDIDATES') {
+        startSafeCandidateProbe(message.tabId, message.options || {}).then(sendResponse).catch(error => sendResponse({ accepted: false, error: error.message }));
+        return true;
+    }
+
+    if (message.type === 'CLEAR_API_PROBE_RESULTS') {
+        chrome.storage.local.remove([apiProbeStorageKey(message.tabId)]).then(() => sendResponse({ success: true })).catch(error => sendResponse({ success: false, error: error.message }));
         return true;
     }
 
@@ -666,6 +805,25 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
     });
 });
 
+chrome.tabs.onRemoved.addListener(tabId => {
+    const timer = apiBadgeTimers.get(tabId);
+    if (timer) clearTimeout(timer);
+    apiBadgeTimers.delete(tabId);
+    staticAnalysisJobs.delete(tabId);
+    candidateProbeJobs.delete(tabId);
+    const pendingWrites = tabCacheWriteQueues.get(tabId) || Promise.resolve();
+    pendingWrites.catch(() => {}).finally(() => {
+        tabCacheWriteQueues.delete(tabId);
+        return chrome.storage.local.remove([
+            apiStorageKey(tabId),
+            apiStorageTraceKey(tabId),
+        staticApiStorageKey(tabId),
+        `${FRONTEND_ANALYSIS_STORAGE_PREFIX}${tabId}`,
+        apiProbeStorageKey(tabId)
+        ]);
+    }).catch(error => console.warn('[AntiDebug] 清理已关闭标签页缓存失败:', error));
+});
+
 // 监听标签URL变化 - 关键修改：只在页面加载完成后更新徽章
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     // 只在页面加载完成后更新徽章
@@ -687,13 +845,13 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
                 if (!previousPageUrl) return;
                 try {
                     if (new URL(previousPageUrl).origin !== nextOrigin) {
-                        chrome.storage.local.remove([apiKey, apiStorageTraceKey(tabId), staticApiStorageKey(tabId)]);
+                        chrome.storage.local.remove([apiKey, apiStorageTraceKey(tabId), staticApiStorageKey(tabId), apiProbeStorageKey(tabId)]);
                     }
                 } catch (_) {}
             });
         } catch (e) {
             // chrome:// 等内部页不会沿用上一站点的接口结果。
-            chrome.storage.local.remove([apiStorageKey(tabId), apiStorageTraceKey(tabId), staticApiStorageKey(tabId)]);
+            chrome.storage.local.remove([apiStorageKey(tabId), apiStorageTraceKey(tabId), staticApiStorageKey(tabId), apiProbeStorageKey(tabId)]);
         }
     }
 });
@@ -790,21 +948,14 @@ async function getApiAnalysisForTab(tabId) {
     const key = apiStorageKey(resolvedTabId);
     const traceKey = apiStorageTraceKey(resolvedTabId);
     const staticKey = staticApiStorageKey(resolvedTabId);
-    const result = await chrome.storage.local.get([key, traceKey, staticKey, 'analysis_excluded_sites']);
+    const result = await chrome.storage.local.get([key, traceKey, staticKey]);
     const analysis = result[key] || { tabId: resolvedTabId, requests: [], endpoints: [], totalCaptured: 0 };
     const storageTraces = result[traceKey] || [];
-    const excludedSites = [...new Set(['w3.org', 'w3c.org', 'schema.org', 'google-analytics.com', 'googletagmanager.com', 'doubleclick.net', 'adtrafficquality.google', 'cloudflareinsights.com', ...(result.analysis_excluded_sites || [])])];
-    const isNoiseRequest = request => {
-        try {
-            const parsed = new URL(request.url || request.rawUrl);
-            if (excludedSites.some(domain => parsed.hostname === domain || parsed.hostname.endsWith(`.${domain}`))) return true;
-            return /\/(?:gen_204|log|collect|analytics|telemetry|rum|beacon)(?:[/?]|$)/i.test(parsed.pathname) && request.transport === 'beacon';
-        } catch (_) { return false; }
-    };
-    const visibleRequests = (analysis.requests || []).filter(request => !isNoiseRequest(request));
+    const visibleRequests = (analysis.requests || []).filter(request => !isExcludedApiNoise(request));
     const visibleEndpoints = rebuildCapturedEndpoints(visibleRequests);
     return {
         ...analysis,
+        requests: visibleRequests,
         endpoints: visibleEndpoints,
         hiddenNoiseCount: Math.max(0, (analysis.requests || []).length - visibleRequests.length),
         storageTraces,
@@ -820,6 +971,139 @@ async function clearApiAnalysisForTab(tabId) {
 
 function staticApiStorageKey(tabId) {
     return `${STATIC_API_STORAGE_PREFIX}${tabId}`;
+}
+
+function apiProbeStorageKey(tabId) {
+    return `${API_PROBE_STORAGE_PREFIX}${tabId}`;
+}
+
+const candidateProbeJobs = new Map();
+
+function classifyProbeResponse(status, contentType, responseUrl, pageUrl) {
+    if (status === 401 || status === 403) return { state: 'exists-auth', label: '接口存在，需要鉴权', confidence: .98 };
+    if (status === 405) return { state: 'exists-method', label: '接口存在，HEAD 方法不允许', confidence: .96 };
+    if (status === 400 || status === 409 || status === 415 || status === 422) return { state: 'exists-params', label: '接口存在，需要参数或请求格式', confidence: .95 };
+    if (status === 404 || status === 410) return { state: 'missing', label: '未发现接口', confidence: .92 };
+    if (status >= 500) return { state: 'server-error', label: '服务端响应异常，接口可能存在', confidence: .75 };
+    if (status >= 200 && status < 300) {
+        let redirectedToLogin = false;
+        try { redirectedToLogin = /(?:login|signin|auth)/i.test(new URL(responseUrl).pathname) && !/(?:login|signin|auth)/i.test(new URL(pageUrl).pathname); } catch (_) {}
+        if (redirectedToLogin) return { state: 'redirect-auth', label: '跳转到登录页，接口可能存在', confidence: .82 };
+        if (/text\/html/i.test(contentType || '')) return { state: 'html-fallback', label: '返回 HTML，可能是前端兜底', confidence: .55 };
+        return { state: 'alive', label: '接口存活', confidence: .95 };
+    }
+    if (status >= 300 && status < 400) return { state: 'redirect', label: '接口发生重定向', confidence: .75 };
+    return { state: 'unknown', label: `HTTP ${status || 0}`, confidence: .4 };
+}
+
+function reusableProbeHeaders(origin) {
+    const profile = sameOriginHeaderProfiles[origin];
+    const headers = {};
+    for (const header of Object.values(profile?.headers || {})) {
+        if (!header?.value || header.category === 'browser' || header.category === 'tracing') continue;
+        if (/^(?:host|content-length|cookie|origin|referer|sec-|connection|accept-encoding)/i.test(header.name || '')) continue;
+        if (header.shareable || header.category === 'custom' || header.category === 'identity') headers[header.name] = header.value;
+    }
+    return headers;
+}
+
+async function probeCandidate(candidate, pageUrl, allowedOrigins, timeoutMs) {
+    const url = new URL(candidate.url);
+    if (!allowedOrigins.has(url.origin)) throw new Error(`候选超出页面证据范围: ${url.origin}`);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const startedAt = Date.now();
+    try {
+        const response = await fetch(url.href, {
+            method: 'HEAD',
+            headers: reusableProbeHeaders(url.origin),
+            credentials: 'include',
+            cache: 'no-store',
+            redirect: 'follow',
+            signal: controller.signal
+        });
+        const contentType = response.headers.get('content-type') || '';
+        const classification = classifyProbeResponse(response.status, contentType, response.url, pageUrl);
+        return {
+            candidateId: candidate.id,
+            url: url.href,
+            originalMethod: candidate.method,
+            probeMethod: 'HEAD',
+            status: response.status,
+            responseUrl: response.url,
+            contentType,
+            responseHeaders: Object.fromEntries(response.headers.entries()),
+            duration: Date.now() - startedAt,
+            checkedAt: Date.now(),
+            ...classification
+        };
+    } catch (error) {
+        return {
+            candidateId: candidate.id,
+            url: url.href,
+            originalMethod: candidate.method,
+            probeMethod: 'HEAD',
+            status: 0,
+            duration: Date.now() - startedAt,
+            checkedAt: Date.now(),
+            state: error?.name === 'AbortError' ? 'timeout' : 'network-error',
+            label: error?.name === 'AbortError' ? '探测超时' : `网络错误：${error.message}`,
+            confidence: 0,
+            error: error.message
+        };
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+async function startSafeCandidateProbe(tabId, options = {}) {
+    if (!tabId) throw new Error('缺少目标 Tab');
+    if (candidateProbeJobs.has(tabId)) return { accepted: true, started: false, status: 'running' };
+    const key = staticApiStorageKey(tabId);
+    const stored = await chrome.storage.local.get([key, apiProbeStorageKey(tabId)]);
+    const analysis = stored[key];
+    if (!analysis?.discovery?.candidates?.length) throw new Error('请先完成 JS 自动分析');
+    const tab = await chrome.tabs.get(tabId);
+    const pageUrl = analysis.pageUrl || tab.url;
+    const allowedOrigins = new Set((analysis.discovery.clients || []).map(client => client.origin));
+    try { allowedOrigins.add(new URL(pageUrl).origin); } catch (_) {}
+    const selectedIds = new Set(Array.isArray(options.candidateIds) ? options.candidateIds : []);
+    const limit = Math.max(1, Math.min(200, Number(options.limit) || 80));
+    const candidates = analysis.discovery.candidates.filter(candidate =>
+        !candidate.confirmedByNetwork && candidate.url && (!selectedIds.size || selectedIds.has(candidate.id))
+    ).slice(0, limit);
+    if (!candidates.length) throw new Error('没有尚未验证的可重组候选');
+
+    const existing = stored[apiProbeStorageKey(tabId)]?.results || [];
+    const resultMap = new Map(existing.map(result => [`${result.originalMethod} ${result.url}`, result]));
+    const state = { tabId, status: 'running', startedAt: Date.now(), total: candidates.length, completed: 0, results: [...resultMap.values()] };
+    await writeAnalysisCache(apiProbeStorageKey(tabId), state);
+    const job = (async () => {
+        const concurrency = Math.max(1, Math.min(6, Number(options.concurrency) || 3));
+        const timeoutMs = Math.max(2000, Math.min(30000, Number(options.timeoutMs) || 10000));
+        const intervalMs = Math.max(100, Math.min(2000, Number(options.intervalMs) || 180));
+        let cursor = 0;
+        const workers = Array.from({ length: Math.min(concurrency, candidates.length) }, async () => {
+            while (cursor < candidates.length) {
+                const candidate = candidates[cursor++];
+                const result = await probeCandidate(candidate, pageUrl, allowedOrigins, timeoutMs);
+                resultMap.set(`${result.originalMethod} ${result.url}`, result);
+                state.completed += 1;
+                state.results = [...resultMap.values()].sort((a, b) => b.checkedAt - a.checkedAt).slice(0, 1000);
+                await writeAnalysisCache(apiProbeStorageKey(tabId), { ...state });
+                chrome.runtime.sendMessage({ type: 'API_PROBE_UPDATE', tabId, data: state }).catch(() => {});
+                if (cursor < candidates.length) await new Promise(resolve => setTimeout(resolve, intervalMs));
+            }
+        });
+        await Promise.all(workers);
+        state.status = 'complete';
+        state.completedAt = Date.now();
+        await writeAnalysisCache(apiProbeStorageKey(tabId), state);
+        chrome.runtime.sendMessage({ type: 'API_PROBE_UPDATE', tabId, data: state }).catch(() => {});
+        return state;
+    })().finally(() => candidateProbeJobs.delete(tabId));
+    candidateProbeJobs.set(tabId, job);
+    return { accepted: true, started: true, status: 'running', total: candidates.length };
 }
 
 function decodeJsString(value) {
@@ -914,14 +1198,28 @@ function analyzeJavaScriptHeuristically(scripts, pageUrl, runtimeRequests = []) 
             }
         }
 
+        const scriptBaseCandidates = new Set();
+        const clientBases = new Map();
+        for (const match of content.matchAll(/(?:baseURL|baseUrl|apiBase|apiPrefix|API_BASE|VITE_[A-Z0-9_]*API[A-Z0-9_]*)\s*[:=]\s*([^,;}\n]{1,500})/g)) {
+            const value = resolveStaticExpression(match[1], constants);
+            if (value) scriptBaseCandidates.add(value);
+        }
+        for (const match of content.matchAll(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:axios|[A-Za-z_$][\w$]*)\.create\s*\(\s*\{[\s\S]{0,1200}?\bbaseURL\s*:\s*([^,}\n]{1,500})/g)) {
+            const value = resolveStaticExpression(match[2], constants);
+            if (value) {
+                clientBases.set(match[1], value);
+                scriptBaseCandidates.add(value);
+            }
+        }
+
         const callPatterns = [
             { regex: /\bfetch\s*\(\s*([^,\n)]{1,500})/g, method: 'GET', evidence: 'fetch()' },
-            { regex: /\.\s*(get|post|put|patch|delete|head)\s*\(\s*([^,\n)]{1,500})/gi, methodGroup: 1, exprGroup: 2, evidence: 'HTTP client' },
+            { regex: /\b([A-Za-z_$][\w$]*)\s*\.\s*(get|post|put|patch|delete|head|options)\s*\(\s*([^,\n)]{1,500})/gi, clientGroup: 1, methodGroup: 2, exprGroup: 3, evidence: 'HTTP client' },
             { regex: /\.open\s*\(\s*(['"])(GET|POST|PUT|PATCH|DELETE|HEAD)\1\s*,\s*([^,\n)]{1,500})/gi, methodGroup: 2, exprGroup: 3, evidence: 'XMLHttpRequest.open()' },
             { regex: /\.\s*request\s*\(\s*\{[\s\S]{0,500}?\burl\s*:\s*([^,}\n]{1,500})/gi, method: 'UNKNOWN', evidence: 'request({ url })' }
         ];
 
-        const addCandidate = (rawValue, method, evidence, index, confidence = .82) => {
+        const addCandidate = (rawValue, method, evidence, index, confidence = .82, clientName = '', callExpression = '') => {
             const value = decodeJsString(rawValue);
             if (!looksLikeStaticEndpoint(value)) return;
             const absolute = /^https?:\/\//i.test(value);
@@ -934,23 +1232,45 @@ function analyzeJavaScriptHeuristically(scripts, pageUrl, runtimeRequests = []) 
             });
             // 未被 Network 证实的相对字符串保持原样，绝不再与所有 baseURL 做笛卡尔积。
             const fullUrls = absolute ? [value] : runtimeMatches.length ? [...new Set(runtimeMatches.map(request => request.url))] : [value];
-            const nearby = content.slice(index, index + 700);
+            const nearby = content.slice(index, index + 1600);
             const ignored = new Set(['url', 'method', 'headers', 'data', 'body', 'params', 'config', 'then', 'catch']);
             const fields = [...nearby.matchAll(/(?:^|[,({])\s*([A-Za-z_$][\w$-]{1,50})\s*:/g)]
-                .map(match => match[1]).filter(name => !ignored.has(name)).slice(0, 24);
+                .map(match => match[1]).filter(name => !ignored.has(name)).slice(0, 100);
+            const requestShape = [...new Set(fields)].map(path => ({ path, type: 'unknown', source: '相邻请求对象' }));
+            const headerNames = [...nearby.matchAll(/(?:headers?\s*:\s*\{|setRequestHeader\s*\()\s*['"]?([A-Za-z][A-Za-z0-9_-]{1,80})/gi)].map(match => match[1]);
+            let inferredMethod = String(method || 'UNKNOWN').toUpperCase();
+            if (inferredMethod === 'GET' && evidence === 'fetch()') {
+                inferredMethod = nearby.match(/\bmethod\s*:\s*['"](GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)['"]/i)?.[1]?.toUpperCase() || 'GET';
+            } else if (inferredMethod === 'UNKNOWN') {
+                inferredMethod = nearby.match(/\bmethod\s*:\s*['"](GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)['"]/i)?.[1]?.toUpperCase() || 'UNKNOWN';
+            }
+            // A named HTTP client owns its configured baseURL. Do not also attach
+            // every other base found in the same minified bundle: large bundles
+            // commonly contain several backends and that creates false joins.
+            const relatedBases = clientName && clientBases.has(clientName)
+                ? new Set([clientBases.get(clientName)])
+                : new Set(scriptBaseCandidates);
             for (const fullUrl of fullUrls) {
                 endpoints.push({
-                    method: String(method || 'UNKNOWN').toUpperCase(),
+                    method: inferredMethod,
                     rawUrl: value,
                     fullUrl,
+                    urlExpression: rawValue,
+                    clientExpression: clientName || (evidence === 'fetch()' ? 'fetch' : ''),
                     source: script.src || `inline:${script.index ?? 0}`,
                     line: content.slice(0, index).split('\n').length,
                     evidence,
                     confidence: runtimeMatches.length ? Math.max(confidence, .97) : (absolute ? confidence : Math.min(confidence, .62)),
                     confirmedByNetwork: absolute ? runtimeRequests.some(request => request.url === fullUrl) : runtimeMatches.length > 0,
                     candidateOnly: !absolute && runtimeMatches.length === 0,
-                    baseCandidates: [...baseCandidates].slice(0, 12),
-                    fields: [...new Set(fields)]
+                    baseCandidates: [...relatedBases].slice(0, 24),
+                    fields: [...new Set(fields)],
+                    requestShape,
+                    inferredHeaders: [...new Set(headerNames)],
+                    bodyExpression: nearby.match(/\b(?:data|body|params)\s*:\s*([^,}\n]{1,500})/)?.[1]?.trim() || '',
+                    callExpression: String(callExpression || rawValue).slice(0, 1200),
+                    before: content.slice(Math.max(0, index - 240), index).replace(/\s+/g, ' '),
+                    after: content.slice(index + String(callExpression || '').length, index + String(callExpression || '').length + 240).replace(/\s+/g, ' ')
                 });
             }
         };
@@ -960,7 +1280,8 @@ function analyzeJavaScriptHeuristically(scripts, pageUrl, runtimeRequests = []) 
                 const expression = match[pattern.exprGroup || 1];
                 const value = resolveStaticExpression(expression, constants);
                 const method = pattern.methodGroup ? match[pattern.methodGroup] : pattern.method;
-                if (value) addCandidate(value, method, pattern.evidence, match.index || 0);
+                const clientName = pattern.clientGroup ? match[pattern.clientGroup] : '';
+                if (value) addCandidate(value, method, pattern.evidence, match.index || 0, .82, clientName, match[0]);
             }
         }
 
@@ -1040,9 +1361,58 @@ function classifyPageResources(resources, excludedExtensions = []) {
     return { counts, entries: entries.slice(0, 1000) };
 }
 
+function isJavaScriptResourceUrl(value) {
+    try { return /\.(?:m?js)(?:[?#]|$)/i.test(new URL(value).href); } catch (_) { return false; }
+}
+
+async function fetchScriptSources(sources, limit = 100) {
+    const selected = [...new Map((sources || []).filter(item => item?.src || item?.content).map(item => [item.src || `inline:${item.index}`, item])).values()].slice(0, limit);
+    const output = [];
+    for (let offset = 0; offset < selected.length; offset += 6) {
+        const batch = selected.slice(offset, offset + 6);
+        const rows = await Promise.all(batch.map(async script => {
+            if (!script.src) return script.content ? script : null;
+            try {
+                const response = await fetch(script.src, { cache: 'force-cache', credentials: 'include' });
+                const content = (await response.text()).slice(0, 2500000);
+                return {
+                    ...script,
+                    content: response.ok ? content : '',
+                    status: response.status,
+                    contentType: response.headers.get('content-type') || '',
+                    error: response.ok ? (content ? '' : '响应正文为空') : `HTTP ${response.status}`
+                };
+            } catch (error) {
+                return { ...script, content: '', status: 0, error: error.message };
+            }
+        }));
+        output.push(...rows.filter(Boolean));
+    }
+    return output;
+}
+
+function discoverReferencedChunkUrls(scripts, pageUrl) {
+    const urls = new Map();
+    for (const script of scripts || []) {
+        const content = script.content || '';
+        for (const match of content.matchAll(/(['"`])([^'"`\s]{1,500}\.(?:m?js)(?:\?[^'"`\s]*)?)\1/g)) {
+            const raw = decodeJsString(match[2]);
+            if (!/(?:chunk|vendor|runtime|bundle|assets|static|js\/|\.[a-f0-9]{6,}\.)/i.test(raw)) continue;
+            try {
+                const url = new URL(raw, script.src || pageUrl).href;
+                if (!urls.has(url)) urls.set(url, { src: url, inline: false, index: `chunk:${urls.size}`, discoveredBy: script.src || script.source || 'runtime' });
+            } catch (_) {}
+            if (urls.size >= 150) break;
+        }
+        if (urls.size >= 150) break;
+    }
+    return [...urls.values()];
+}
+
 async function discoverSourceMaps(scripts, pageUrl) {
-    const maps = [];
-    for (const script of scripts.filter(item => item.content && item.index !== -1).slice(0, 40)) {
+    const entries = [];
+    const sourceScripts = [];
+    for (const script of scripts.filter(item => item.content && item.index !== -1).slice(0, 100)) {
         const matches = [...script.content.matchAll(/[#@]\s*sourceMappingURL\s*=\s*([^\s*]+)/g)];
         const reference = matches.at(-1)?.[1]?.trim();
         if (!reference) continue;
@@ -1057,14 +1427,14 @@ async function discoverSourceMaps(scripts, pageUrl) {
                 parsedMap = JSON.parse(text);
             } else {
                 name = new URL(reference, script.src || pageUrl).href;
-                const response = await fetch(name, { cache: 'force-cache' });
+                const response = await fetch(name, { cache: 'force-cache', credentials: 'include' });
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
                 parsedMap = JSON.parse((await response.text()).slice(0, 8000000));
             }
         } catch (sourceMapError) {
             error = sourceMapError.message;
         }
-        maps.push({
+        entries.push({
             name,
             initiatorType: 'sourceMappingURL',
             sourceScript: script.src || `inline:${script.index ?? 0}`,
@@ -1075,8 +1445,27 @@ async function discoverSourceMaps(scripts, pageUrl) {
             nameCount: parsedMap?.names?.length || 0,
             error
         });
+        if (Array.isArray(parsedMap?.sourcesContent)) {
+            parsedMap.sourcesContent.slice(0, 300).forEach((content, index) => {
+                if (!content || sourceScripts.length >= 500) return;
+                const sourceName = parsedMap.sources?.[index] || `source-${index}.js`;
+                let sourceUrl = sourceName;
+                try { sourceUrl = new URL(sourceName, parsedMap.sourceRoot ? new URL(parsedMap.sourceRoot, name) : name).href; } catch (_) {}
+                sourceScripts.push({
+                    source: `sourcemap:${sourceUrl}`,
+                    src: sourceUrl,
+                    index: `map:${sourceScripts.length}`,
+                    inline: true,
+                    content: String(content).slice(0, 1500000),
+                    sourceMap: name
+                });
+            });
+        }
     }
-    return [...new Map(maps.map(item => [item.name, item])).values()];
+    return {
+        entries: [...new Map(entries.map(item => [item.name, item])).values()],
+        scripts: sourceScripts
+    };
 }
 
 function isValidChineseIdCard(value) {
@@ -1109,12 +1498,16 @@ function analyzeSecurityArtifacts(scripts, excludedDomains) {
         ['AES', /\baes(?:128|192|256)?\b/gi], ['DES/3DES', /\b(?:des|tripledes|3des)\b/gi],
         ['RSA', /\brsa\b|BEGIN (?:RSA )?PUBLIC KEY/gi],
         ['SM2', /\bsm2\b/gi], ['SM3', /\bsm3\b/gi], ['SM4', /\bsm4\b/gi],
+        ['bcrypt', /\bbcrypt\b|\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}/g],
         ['Base64', /\b(?:base64|btoa|atob)\b/gi]
     ];
     const sensitivePatterns = [
         { type: 'JWT', regex: /\beyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{5,}\b/g, confidence: '高', reason: '符合 JWT 三段结构' },
-        { type: 'Authorization/Token', regex: /\b(?:authorization|access[_-]?token|auth[_-]?token)\b[\s"']*[:=][\s"']*[^\s"'<]{8,}/gi, validate: isUsefulSecretMatch, confidence: '高', reason: '身份字段名与非占位值同时命中' },
-        { type: 'API Key/Secret', regex: /\b(?:api[_-]?key|client[_-]?secret|secret[_-]?key)\b[\s"']*[:=][\s"']*[^\s"'<]{8,}/gi, validate: isUsefulSecretMatch, confidence: '高', reason: '密钥字段名与非占位值同时命中' },
+        { type: 'Authorization/Token', regex: /["']?(?:authorization|access[_-]?token|auth[_-]?token)["']?\s*[:=]\s*(["'])[^"'\\\r\n]{8,}\1/gi, validate: isUsefulSecretMatch, confidence: '高', reason: '身份字段直接绑定了引号包裹的非占位常量' },
+        { type: 'API Key/Secret', regex: /["']?(?:api[_-]?key|client[_-]?secret|secret[_-]?key)["']?\s*[:=]\s*(["'])[^"'\\\r\n]{8,}\1/gi, validate: isUsefulSecretMatch, confidence: '高', reason: '密钥字段直接绑定了引号包裹的非占位常量' },
+        { type: 'bcrypt 密码哈希', regex: /["']?(?:password|passwd|pwd|passwordHash|hashedPassword)["']?\s*[:=]\s*(["'])\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}\1/gi, confidence: '高', reason: '密码字段与标准 bcrypt 60 字符哈希常量同时命中；bcrypt 为带盐单向哈希，不能直接解密' },
+        { type: 'bcrypt 哈希', regex: /\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}/g, validate: (match, content) => !hasSensitiveFieldContext(content, match.index || 0, /(?:password|passwd|pwd|passwordHash|hashedPassword)/i), confidence: '高', reason: '符合 bcrypt 版本、cost 与 53 字符 salt/hash 结构；属于单向哈希，不能直接解密' },
+        { type: '硬编码密码', regex: /["']?(?:password|passwd|pwd)["']?\s*[:=]\s*(["'])([^"'\\\r\n]{8,})\1/g, validate: match => isUsefulSecretMatch(match) && !/\$2[aby]\$/.test(match[0]) && !/\s/.test(match[2] || '') && /[A-Za-z]/.test(match[2] || '') && /(?:\d|[^A-Za-z0-9])/.test(match[2] || ''), confidence: '高', reason: '小写密码字段直接绑定了无空白、同时含字母与数字/符号的常量；变量、表单绑定、空值和国际化文案不会命中' },
         { type: '私钥', regex: /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/g, confidence: '高', reason: '私钥 PEM 头' },
         { type: '邮箱', regex: /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, confidence: '中', reason: '完整邮箱格式' },
         { type: '中国手机号', regex: /(?<!\d)1[3-9]\d{9}(?!\d)/g, validate: (match, content) => hasSensitiveFieldContext(content, match.index || 0, /(?:phone|mobile|tel|手机号|电话|联系方式)/i), confidence: '中', reason: '号码格式有效且附近存在手机号字段语义' },
@@ -1225,9 +1618,21 @@ async function analyzePageJavaScript(tabId) {
                 transferSize: 0
             })).filter(item => item.name),
             storageSnapshot: {
-                localStorage: Object.fromEntries(Object.entries(localStorage).slice(0, 300)),
-                sessionStorage: Object.fromEntries(Object.entries(sessionStorage).slice(0, 300))
+                localStorage: Object.fromEntries(Object.entries(localStorage).slice(0, 1000)),
+                sessionStorage: Object.fromEntries(Object.entries(sessionStorage).slice(0, 1000)),
+                runtimeConfig: Object.fromEntries(['__ENV__', '__CONFIG__', '__INITIAL_STATE__', 'env', 'config'].flatMap(key => {
+                    try {
+                        const value = window[key];
+                        if (value == null) return [];
+                        return [[key, typeof value === 'string' ? value.slice(0, 250000) : JSON.stringify(value).slice(0, 250000)]];
+                    } catch (_) { return []; }
+                }))
             },
+            connectionHints: [
+                ...[...document.querySelectorAll('link[rel="preconnect"],link[rel="dns-prefetch"]')].map(link => ({ value: link.href, type: link.rel, source: 'document.link', confidence: .72 })),
+                ...[...document.querySelectorAll('meta[http-equiv="Content-Security-Policy" i]')].flatMap(meta => (meta.content.match(/https?:\/\/[^\s;]+/g) || []).map(value => ({ value, type: 'csp-connect-src', source: 'meta CSP', confidence: .78 }))),
+                ...(navigator.serviceWorker?.controller?.scriptURL ? [{ value: navigator.serviceWorker.controller.scriptURL, type: 'service-worker', source: 'navigator.serviceWorker.controller', confidence: .7 }] : [])
+            ],
             scripts: [...document.scripts].map((script, index) => ({
                 index,
                 src: script.src || null,
@@ -1237,20 +1642,20 @@ async function analyzePageJavaScript(tabId) {
         })
     });
     const pageData = pageResult[0]?.result || { pageUrl: tab.url, scripts: [] };
-    const selected = pageData.scripts.slice(0, 50);
-    const scripts = pageData.html ? [{ source: `document:${pageData.pageUrl}`, content: pageData.html, index: -1 }] : [];
-    for (const script of selected) {
-        if (script.inline) {
-            if (script.content) scripts.push(script);
-            continue;
-        }
-        try {
-            const response = await fetch(script.src, { cache: 'force-cache' });
-            scripts.push({ ...script, content: (await response.text()).slice(0, 1500000), status: response.status });
-        } catch (error) {
-            scripts.push({ ...script, content: '', error: error.message });
-        }
-    }
+    const resourceScripts = (pageData.resources || []).filter(resource => isJavaScriptResourceUrl(resource.name)).map((resource, index) => ({
+        src: resource.name, inline: false, index: `resource:${index}`, discoveredBy: resource.initiatorType || 'performance'
+    }));
+    const fetchedScripts = await fetchScriptSources([...(pageData.scripts || []), ...resourceScripts], 160);
+    const referencedChunks = discoverReferencedChunkUrls(fetchedScripts, pageData.pageUrl || tab.url)
+        .filter(chunk => !fetchedScripts.some(script => script.src === chunk.src));
+    const chunkScripts = await fetchScriptSources(referencedChunks, 120);
+    const initialScripts = [...fetchedScripts, ...chunkScripts];
+    const sourceMapDiscovery = await discoverSourceMaps(initialScripts, pageData.pageUrl || tab.url);
+    const scripts = [
+        ...(pageData.html ? [{ source: `document:${pageData.pageUrl}`, content: pageData.html, index: -1 }] : []),
+        ...initialScripts,
+        ...sourceMapDiscovery.scripts
+    ];
     const runtimeAnalysis = await getApiAnalysisForTab(tabId);
     let endpoints = analyzeJavaScriptHeuristically(scripts, pageData.pageUrl || tab.url, runtimeAnalysis.requests || []);
     let astEngine = 'browser-evidence';
@@ -1258,7 +1663,7 @@ async function analyzePageJavaScript(tabId) {
         try {
             const astResult = await self.mcpClient.analyzeScriptsLocally({
                 pageUrl: pageData.pageUrl || tab.url,
-                scripts: scripts.filter(item => item.index !== -1 && item.content).slice(0, 16).map(item => ({ ...item, content: item.content.slice(0, 750000) }))
+                scripts: scripts.filter(item => item.index !== -1 && item.content).slice(0, 40).map(item => ({ ...item, content: item.content.slice(0, 1500000) }))
             });
             astEngine = astResult.engine || 'babel-ast';
             const astCandidates = (astResult.endpoints || []).map(endpoint => {
@@ -1292,43 +1697,90 @@ async function analyzePageJavaScript(tabId) {
     const stringEvidence = collectScriptStringEvidence(scripts);
     for (const [storage, values] of Object.entries(pageData.storageSnapshot || {})) {
         for (const [key, value] of Object.entries(values || {})) {
-            if (/^(?:https?:\/\/|\/)[^\s]{1,1000}$/i.test(String(value))) {
-                stringEvidence.baseUrls.push({ value: String(value), source: `${storage}.${key}`, line: null, evidence: '运行时 Storage 快照' });
+            const source = `${storage}.${key}`;
+            const candidates = self.apiAnalyzer.flattenConfigValues?.(value, source) || [];
+            if (!stringEvidence.storageReferences.some(item => item.value === key && item.source === source)) {
+                stringEvidence.storageReferences.push({ value: key, source, line: null, evidence: '运行时 Storage 快照' });
+            }
+            for (const candidate of candidates) {
+                const item = { value: candidate.value, source: candidate.path || source, line: null, evidence: '运行时 Storage 快照（含 JSON 递归）' };
+                let target = stringEvidence.businessPaths;
+                let limit = 300;
+                if (/^https?:\/\//i.test(candidate.value)) {
+                    try {
+                        const parsed = new URL(candidate.value);
+                        const segments = parsed.pathname.split('/').filter(Boolean);
+                        const isAsset = /\.(?:m?js|css|map|svg|png|jpe?g|gif|webp|ico|woff2?|ttf|mp[34]|webm)(?:$|[?#])/i.test(parsed.pathname);
+                        const keySuggestsBase = /(?:^|[._-])(?:base(?:url)?|api(?:base|root|host|origin|server)|gateway|server(?:url)?|origin|host)(?:$|[._-])/i.test(item.source);
+                        const pathSuggestsBase = segments.length <= 4 && /\/(?:api|meta|gateway|rest|openapi|graphql|rpc|v\d+)\/?$/i.test(parsed.pathname);
+                        if (!isAsset && (parsed.pathname === '/' || keySuggestsBase || pathSuggestsBase)) {
+                            target = stringEvidence.baseUrls;
+                            limit = 100;
+                        }
+                    } catch (_) {}
+                } else if (/\/(?:api|meta|gateway|rest|openapi|graphql|rpc|v\d+)(?:\/|$)/i.test(candidate.value) && candidate.value.split('/').filter(Boolean).length <= 3) {
+                    target = stringEvidence.apiPrefixes;
+                    limit = 150;
+                }
+                if (target.length < limit && !target.some(existing => existing.value === item.value && existing.source === item.source)) target.push(item);
             }
         }
     }
     const settings = await chrome.storage.local.get(['analysis_excluded_sites', 'analysis_excluded_resource_extensions']);
-    const excludedDomains = [...new Set(['w3.org', 'w3c.org', 'schema.org', 'google-analytics.com', 'googletagmanager.com', 'doubleclick.net', 'adtrafficquality.google', 'cloudflareinsights.com', ...(settings.analysis_excluded_sites || [])])];
+    const excludedDomains = [...new Set(['w3.org', 'w3c.org', 'schema.org', 'google-analytics.com', 'googletagmanager.com', 'doubleclick.net', 'adtrafficquality.google', 'cloudflareinsights.com', 'tongji-collector.dcloud.net.cn', ...(settings.analysis_excluded_sites || [])])];
     const excludedExtensions = settings.analysis_excluded_resource_extensions || ['css', 'svg', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'woff', 'woff2', 'ttf', 'ico'];
     const security = analyzeSecurityArtifacts(scripts, excludedDomains);
-    const discoveredSourceMaps = await discoverSourceMaps(scripts, pageData.pageUrl || tab.url);
+    const discovery = self.discoveryEngine?.buildDiscoveryModel?.({
+        pageUrl: pageData.pageUrl || tab.url,
+        runtimeRequests: runtimeAnalysis.requests || [],
+        staticEndpoints: endpoints,
+        stringEvidence,
+        runtimeEvidence: runtimeAnalysis.intelligence?.runtimeEvidence || [],
+        connectionHints: pageData.connectionHints || []
+    }) || { clients: [], candidates: [], unresolved: [], stats: {} };
     const resourceMap = new Map();
     for (const resource of [
         ...(pageData.resources || []),
         ...(pageData.domResources || []),
-        ...discoveredSourceMaps,
+        ...sourceMapDiscovery.entries,
         ...(runtimeAnalysis.requests || []).map(request => ({ name: request.url, initiatorType: request.transport || 'xmlhttprequest', duration: request.duration || 0, transferSize: 0 }))
     ]) {
         if (resource?.name && !resourceMap.has(resource.name)) resourceMap.set(resource.name, resource);
     }
     const resources = classifyPageResources([...resourceMap.values()], excludedExtensions);
+    const scriptDiagnostics = [...initialScripts, ...sourceMapDiscovery.scripts].map(script => ({
+        source: script.src || script.source || `inline:${script.index ?? 0}`,
+        discoveredBy: script.discoveredBy || (script.sourceMap ? 'source-map' : script.inline ? 'inline-script' : 'document-script'),
+        status: script.status ?? (script.sourceMap ? 'embedded' : script.inline ? 'inline' : 0),
+        contentType: script.contentType || '',
+        bytesAnalyzed: String(script.content || '').length,
+        analyzed: Boolean(script.content),
+        sourceMap: script.sourceMap || '',
+        error: script.error || ''
+    })).slice(0, 500);
     const result = {
-        analysisVersion: 7,
+        analysisVersion: 13,
         tabId,
         pageUrl: pageData.pageUrl || tab.url,
         status: 'complete',
         analyzedAt: Date.now(),
-        scriptsDiscovered: pageData.scripts.length,
+        // scriptsReferenced 是 DOM/Performance/Chunk 发现次数；scriptsDiscovered
+        // 是去重后的真实脚本数，避免同一 app.js 被算两次造成“8/13”假失败。
+        scriptsReferenced: (pageData.scripts || []).length + resourceScripts.length + referencedChunks.length,
+        scriptsDiscovered: scriptDiagnostics.length,
         // 页面 HTML 也参与安全识别，但不应被误算成一个 JS 文件。
         scriptsAnalyzed: scripts.filter(item => item.index !== -1 && item.content).length,
+        scriptsFailed: scriptDiagnostics.filter(item => !item.analyzed).length,
+        scriptDiagnostics,
         documentAnalyzed: Boolean(pageData.html),
         astEngine,
         endpoints,
         stringEvidence,
+        discovery,
         resources,
         security
     };
-    await chrome.storage.local.set({ [staticApiStorageKey(tabId)]: result });
+    await writeAnalysisCache(staticApiStorageKey(tabId), result);
     return result;
 }
 
@@ -1337,11 +1789,12 @@ const staticAnalysisJobs = new Map();
 function startPageJavaScriptAnalysis(tabId) {
     if (staticAnalysisJobs.has(tabId)) return false;
     const key = staticApiStorageKey(tabId);
-    const task = chrome.storage.local.set({ [key]: { tabId, status: 'running', startedAt: Date.now(), endpoints: [], security: { algorithms: [], findings: [], urls: [] } } })
+    const task = writeAnalysisCache(key, { tabId, status: 'running', startedAt: Date.now(), endpoints: [], security: { algorithms: [], findings: [], urls: [] } })
+        .catch(error => console.warn('[AntiDebug] 无法保存 JS 分析状态，继续在内存中分析:', error))
         .then(() => analyzePageJavaScript(tabId))
         .catch(async error => {
             const failure = { tabId, status: 'error', analyzedAt: Date.now(), error: error.message, endpoints: [], security: { algorithms: [], findings: [], urls: [] } };
-            await chrome.storage.local.set({ [key]: failure });
+            await writeAnalysisCache(key, failure).catch(() => {});
             return failure;
         })
         .then(result => {
@@ -1381,7 +1834,11 @@ function rebuildCapturedEndpoints(requests) {
     return [...endpointMap.values()].sort((a, b) => (b.lastCapturedAt || 0) - (a.lastCapturedAt || 0));
 }
 
-async function storeApiCapture(rawCapture, tabId, frameId = 0, fallbackPageUrl = '') {
+function storeApiCapture(rawCapture, tabId, frameId = 0, fallbackPageUrl = '') {
+    return enqueueTabCacheWrite(tabId, () => storeApiCaptureNow(rawCapture, tabId, frameId, fallbackPageUrl));
+}
+
+async function storeApiCaptureNow(rawCapture, tabId, frameId = 0, fallbackPageUrl = '') {
     const pageUrl = rawCapture.pageUrl || fallbackPageUrl;
     const analyzed = self.apiAnalyzer.analyzeRequest({
         ...rawCapture,
@@ -1390,6 +1847,10 @@ async function storeApiCapture(rawCapture, tabId, frameId = 0, fallbackPageUrl =
         capturedAt: rawCapture.capturedAt || rawCapture.completedAt || rawCapture.startedAt || Date.now(),
         source: rawCapture.source || 'runtime-monitor'
     }, pageUrl);
+
+    // 默认统计域名和用户维护的排除域名在采集入口直接丢弃：不写缓存、
+    // 不显示徽章，也不转发到 MCP。这样不会出现“先 Catch 再隐藏”。
+    if (isExcludedApiNoise(analyzed)) return analyzed;
 
     const key = apiStorageKey(tabId);
     const current = await getApiAnalysisForTab(tabId);
@@ -1411,7 +1872,7 @@ async function storeApiCapture(rawCapture, tabId, frameId = 0, fallbackPageUrl =
         bodyPreview: analyzed.bodyPreview || requests[duplicateIndex].bodyPreview
     };
     requests.sort((a, b) => (b.capturedAt || b.startedAt || 0) - (a.capturedAt || a.startedAt || 0));
-    requests.splice(200);
+    requests.splice(API_REQUEST_LIMIT);
 
     const analysis = {
         tabId,
@@ -1421,7 +1882,7 @@ async function storeApiCapture(rawCapture, tabId, frameId = 0, fallbackPageUrl =
         requests,
         endpoints: rebuildCapturedEndpoints(requests)
     };
-    await chrome.storage.local.set({ [key]: analysis });
+    await writeAnalysisCache(key, compactStoredApiAnalysis(analysis, tabId));
 
     if (self.mcpClient?.addNetworkRequest) self.mcpClient.addNetworkRequest(analyzed);
     showApiCapturedBadge(tabId, analyzed);
@@ -1458,9 +1919,13 @@ async function captureChromeNetworkRequest(details) {
     }, details.tabId, details.frameId ?? 0, tab?.url || '');
 }
 
-async function patchCapturedNetworkRequest(requestId, patch) {
+function patchCapturedNetworkRequest(requestId, patch) {
     const tabId = networkRequestTabs.get(requestId);
-    if (tabId == null) return;
+    if (tabId == null) return Promise.resolve();
+    return enqueueTabCacheWrite(tabId, () => patchCapturedNetworkRequestNow(tabId, requestId, patch));
+}
+
+async function patchCapturedNetworkRequestNow(tabId, requestId, patch) {
     const key = apiStorageKey(tabId);
     const stored = await chrome.storage.local.get([key]);
     const analysis = stored[key];
@@ -1470,7 +1935,7 @@ async function patchCapturedNetworkRequest(requestId, patch) {
     analysis.requests[index] = self.apiAnalyzer.analyzeRequest({ ...analysis.requests[index], ...patch }, analysis.pageUrl || analysis.requests[index].pageUrl);
     analysis.endpoints = rebuildCapturedEndpoints(analysis.requests);
     analysis.updatedAt = Date.now();
-    await chrome.storage.local.set({ [key]: analysis });
+    await writeAnalysisCache(key, compactStoredApiAnalysis(analysis, tabId));
     chrome.runtime.sendMessage({ type: 'API_CAPTURE_UPDATE', tabId, data: analysis, latest: analysis.requests[index] }).catch(() => {});
 }
 

@@ -1,10 +1,11 @@
 {
   "name": "AntiDebug Breaker",
-  "version": "3.5.3",
+  "version": "3.6.0",
   "description": "基于 AntiDebug Breaker 进行二次开发",
   "manifest_version": 3,
   "permissions": [
     "storage",
+    "unlimitedStorage",
     "scripting",
     "activeTab",
     "tabs",

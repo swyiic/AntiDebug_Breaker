@@ -9,8 +9,8 @@
 
 // ============== 配置 ==============
 const MCP_DEFAULT_PORT = 9527;
-const RECONNECT_INTERVAL = 5000; // 重连间隔（毫秒）
-const MAX_RECONNECT_ATTEMPTS = 10;
+const RECONNECT_BASE_INTERVAL = 1500;
+const RECONNECT_MAX_INTERVAL = 30000;
 
 // ============== 状态 ==============
 let ws = null;
@@ -23,11 +23,29 @@ let mcpCandidateIndex = 0;
 let networkRequests = []; // 存储网络请求
 let hookDataBuffer = []; // 存储Hook捕获的数据
 let heartbeatInterval = null; // 心跳定时器
+let reconnectTimer = null;
+let nextReconnectAt = 0;
 let lastPongTime = 0; // 最后收到 pong 的时间
 const localAnalysisRequests = new Map();
 let serverCapabilities = new Set();
 const HEARTBEAT_INTERVAL = 5000; // 心跳间隔 5 秒
 const HEARTBEAT_TIMEOUT = 10000; // 心跳超时 10 秒
+const MCP_DEFAULT_EXCLUDED_DOMAINS = ['w3.org', 'w3c.org', 'schema.org', 'google-analytics.com', 'googletagmanager.com', 'doubleclick.net', 'adtrafficquality.google', 'cloudflareinsights.com', 'tongji-collector.dcloud.net.cn'];
+let mcpExcludedDomains = new Set(MCP_DEFAULT_EXCLUDED_DOMAINS);
+
+function updateMcpExcludedDomains(custom = []) {
+    mcpExcludedDomains = new Set([...MCP_DEFAULT_EXCLUDED_DOMAINS, ...(Array.isArray(custom) ? custom : [])]
+        .map(value => String(value || '').trim().toLowerCase()).filter(Boolean));
+}
+
+function isMcpExcludedRequest(request) {
+    try {
+        const parsed = new URL(request?.url || request?.rawUrl);
+        return [...mcpExcludedDomains].some(domain => parsed.hostname === domain || parsed.hostname.endsWith(`.${domain}`));
+    } catch (_) { return false; }
+}
+
+chrome.storage.local.get(['analysis_excluded_sites'], result => updateMcpExcludedDomains(result.analysis_excluded_sites));
 
 // 获取当前MCP WebSocket URL
 function getMCPWsUrl() {
@@ -40,6 +58,27 @@ function prepareMCPPortCandidates(configuredPort) {
     mcpPortCandidates = [...new Set([safeRequested, 9527])];
     mcpCandidateIndex = 0;
     mcpPort = mcpPortCandidates[0];
+}
+
+function clearReconnectTimer() {
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    nextReconnectAt = 0;
+}
+
+function scheduleReconnect(reason = '连接断开') {
+    if (!mcpEnabled || reconnectTimer || (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN))) return;
+    reconnectAttempts += 1;
+    mcpCandidateIndex = (mcpCandidateIndex + 1) % mcpPortCandidates.length;
+    mcpPort = mcpPortCandidates[mcpCandidateIndex];
+    const delay = Math.min(RECONNECT_MAX_INTERVAL, RECONNECT_BASE_INTERVAL * (2 ** Math.min(5, Math.max(0, reconnectAttempts - 1))));
+    nextReconnectAt = Date.now() + delay;
+    console.log(`[MCP Client] ${reason}；${Math.ceil(delay / 1000)} 秒后进行第 ${reconnectAttempts} 次重连`);
+    reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        nextReconnectAt = 0;
+        connectToMCP();
+    }, delay);
 }
 
 // ============== WebSocket 连接管理 ==============
@@ -65,16 +104,20 @@ function connectToMCP() {
         return;
     }
 
+    clearReconnectTimer();
     const wsUrl = getMCPWsUrl();
     console.log('[MCP Client] 正在连接到MCP服务器:', wsUrl);
     
     try {
-        ws = new WebSocket(wsUrl);
+        const socket = new WebSocket(wsUrl);
+        ws = socket;
 
-        ws.onopen = () => {
+        socket.onopen = () => {
+            if (ws !== socket) return socket.close();
             console.log('[MCP Client] 已连接到MCP服务器');
             isConnected = true;
             reconnectAttempts = 0;
+            clearReconnectTimer();
             lastPongTime = Date.now();
             chrome.storage.local.set({ mcp_port: mcpPort });
             
@@ -85,7 +128,8 @@ function connectToMCP() {
             sendCurrentPageInfo();
         };
 
-        ws.onmessage = (event) => {
+        socket.onmessage = (event) => {
+            if (ws !== socket) return;
             try {
                 const message = JSON.parse(event.data);
                 // 处理心跳响应
@@ -111,35 +155,29 @@ function connectToMCP() {
             }
         };
 
-        ws.onclose = () => {
+        socket.onclose = () => {
+            if (ws !== socket) return;
             console.log('[MCP Client] 与MCP服务器断开连接');
-            handleDisconnect();
-            
-            // 尝试重连
-            if (mcpEnabled && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-                reconnectAttempts++;
-                mcpCandidateIndex = (mcpCandidateIndex + 1) % mcpPortCandidates.length;
-                mcpPort = mcpPortCandidates[mcpCandidateIndex];
-                console.log(`[MCP Client] ${RECONNECT_INTERVAL/1000}秒后重连 (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
-                setTimeout(connectToMCP, RECONNECT_INTERVAL);
-            }
+            handleDisconnect(socket);
+            scheduleReconnect('服务不可用');
         };
 
-        ws.onerror = (error) => {
+        socket.onerror = (error) => {
             console.error('[MCP Client] WebSocket错误:', error);
-            // 触发断开处理
-            handleDisconnect();
+            try { socket.close(); } catch (_) {}
         };
     } catch (e) {
         console.error('[MCP Client] 创建WebSocket失败:', e);
         handleDisconnect();
+        scheduleReconnect('创建连接失败');
     }
 }
 
 // 处理断开连接
-function handleDisconnect() {
+function handleDisconnect(socket = ws) {
+    if (socket && ws && socket !== ws) return;
     isConnected = false;
-    ws = null;
+    if (!socket || ws === socket) ws = null;
     serverCapabilities = new Set();
     for (const pending of localAnalysisRequests.values()) {
         clearTimeout(pending.timeout);
@@ -157,18 +195,17 @@ function startHeartbeat() {
         if (!ws || ws.readyState !== WebSocket.OPEN) {
             console.log('[MCP Client] 心跳检测：连接已断开');
             handleDisconnect();
+            scheduleReconnect('心跳发现连接断开');
             return;
         }
         
         // 检查上次 pong 时间，如果超时则认为断开
         if (Date.now() - lastPongTime > HEARTBEAT_TIMEOUT) {
             console.log('[MCP Client] 心跳超时，连接可能已断开');
-            handleDisconnect();
-            // 尝试重连
-            if (mcpEnabled && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-                reconnectAttempts++;
-                setTimeout(connectToMCP, RECONNECT_INTERVAL);
-            }
+            const staleSocket = ws;
+            try { staleSocket?.close(); } catch (_) {}
+            handleDisconnect(staleSocket);
+            scheduleReconnect('心跳超时');
             return;
         }
         
@@ -177,7 +214,10 @@ function startHeartbeat() {
             ws.send(JSON.stringify({ type: 'PING', timestamp: Date.now() }));
         } catch (e) {
             console.error('[MCP Client] 发送心跳失败:', e);
-            handleDisconnect();
+            const staleSocket = ws;
+            try { staleSocket?.close(); } catch (_) {}
+            handleDisconnect(staleSocket);
+            scheduleReconnect('心跳发送失败');
         }
     }, HEARTBEAT_INTERVAL);
 }
@@ -192,13 +232,19 @@ function stopHeartbeat() {
 
 // 断开MCP连接
 function disconnectFromMCP() {
+    clearReconnectTimer();
     stopHeartbeat();
-    if (ws) {
-        ws.close();
-        ws = null;
+    const socket = ws;
+    ws = null;
+    if (socket) {
+        socket.onopen = null;
+        socket.onmessage = null;
+        socket.onerror = null;
+        socket.onclose = null;
+        try { socket.close(); } catch (_) {}
     }
-    isConnected = false;
-    reconnectAttempts = MAX_RECONNECT_ATTEMPTS; // 阻止重连
+    handleDisconnect(null);
+    reconnectAttempts = 0;
 }
 
 // 发送消息到MCP服务器
@@ -1971,7 +2017,14 @@ async function getCapturedApiAnalysis({ tabId } = {}) {
     if (!resolvedTabId) return { requests: [], endpoints: [], totalCaptured: 0 };
     const key = `api_analysis_tab_${resolvedTabId}`;
     const result = await chrome.storage.local.get([key]);
-    return result[key] || { tabId: resolvedTabId, requests: [], endpoints: [], totalCaptured: 0 };
+    const analysis = result[key] || { tabId: resolvedTabId, requests: [], totalCaptured: 0 };
+    const requests = analysis.requests || [];
+    return {
+        ...analysis,
+        requests,
+        // endpoints 不再重复持久化；MCP 读取时从事实请求重建。
+        endpoints: self.apiAnalyzer?.dedupeRequests?.(requests) || requests
+    };
 }
 
 async function clearCapturedApiAnalysis({ tabId } = {}) {
@@ -2989,6 +3042,7 @@ function addHookData(data) {
 
 // ============== 网络请求拦截 ==============
 function addNetworkRequest(request) {
+    if (isMcpExcludedRequest(request)) return false;
     const normalized = {
         ...request,
         timestamp: request.timestamp || Date.now(),
@@ -3015,6 +3069,7 @@ function addNetworkRequest(request) {
     if (isConnected) {
         sendToMCP('NETWORK_REQUEST', normalized);
     }
+    return true;
 }
 
 // 使用 chrome.webRequest 监听所有网络请求
@@ -3053,6 +3108,7 @@ chrome.webRequest.onCompleted.addListener(
 // ============== 监听存储变化 ==============
 chrome.storage.onChanged.addListener((changes, namespace) => {
     if (namespace === 'local') {
+        if (changes.analysis_excluded_sites) updateMcpExcludedDomains(changes.analysis_excluded_sites.newValue);
         // MCP启用状态变化
         if (changes.mcp_enabled) {
             mcpEnabled = changes.mcp_enabled.newValue === true;
@@ -3102,20 +3158,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             console.log('[MCP Client] 状态不一致，更新为断开');
             handleDisconnect();
         }
-        
-        // 判断是否连接失败（重连次数用尽且未连接）
-        const hasError = mcpEnabled && !actuallyConnected && !isConnecting && reconnectAttempts >= MAX_RECONNECT_ATTEMPTS;
+        if (mcpEnabled && !actuallyConnected && !isConnecting && !reconnectTimer) scheduleReconnect('状态检查恢复连接');
         
         sendResponse({ 
             connected: actuallyConnected, 
             enabled: mcpEnabled,
             connecting: isConnecting,
-            error: hasError,
+            error: false,
+            retrying: Boolean(reconnectTimer),
             wsUrl: getMCPWsUrl(),
             port: mcpPort,
             wsState: ws ? ws.readyState : -1, // 0=CONNECTING, 1=OPEN, 2=CLOSING, 3=CLOSED
             reconnectAttempts: reconnectAttempts,
-            maxReconnectAttempts: MAX_RECONNECT_ATTEMPTS,
+            maxReconnectAttempts: null,
+            nextReconnectAt,
             lastPongTime: lastPongTime
         });
         return true;
